@@ -2,7 +2,7 @@
 
 #include <cstddef>
 
-#include "ColumnStorage.h"
+#include "Block.h"
 #include "JoinOutput.h"
 
 
@@ -13,14 +13,16 @@ struct ChjResult
 {
     PhaseTiming build;
     PhaseTiming probe;
+    double e2e_wall_ms = 0.0;
     JoinOutput output;
 };
 
 
-/// Concurrent hash join. A 256-way two-level hashtable is built in parallel
-/// by `threads` workers, each owning a slice of build rows. The build/probe
-/// barrier is the std::thread join at the end of build. Probe materialises
-/// matched pairs into per-worker column-major output chains.
-ChjResult runCHJ(const ColumnSet & build_cs, const ColumnSet & probe_cs, size_t threads);
+/// Concurrent hash join. A 256-way two-level hashtable is built in
+/// parallel by `threads` workers, each owning a slice of build blocks.
+/// The build store is shared across all sub-tables; concurrent block
+/// appends serialise on the store's mutex. Probe materialises matched
+/// pairs into per-worker output blocks (~10K rows each).
+ChjResult runCHJ(const BlockStream & build, const BlockStream & probe, size_t threads);
 
 }

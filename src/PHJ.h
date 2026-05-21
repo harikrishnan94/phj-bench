@@ -2,7 +2,7 @@
 
 #include <cstddef>
 
-#include "ColumnStorage.h"
+#include "Block.h"
 #include "JoinOutput.h"
 #include "RadixPartition.h"
 
@@ -16,16 +16,17 @@ struct PhjResult
     PhaseTiming build;
     PhaseTiming probe_shuffle;
     PhaseTiming probe;
+    double e2e_wall_ms = 0.0;
     JoinOutput output;
 };
 
 
-/// Radix-partitioned hash join with work-stealing per-partition scheduling.
-/// `cfg` configures the partition fanout (and optional multi-pass) for both
-/// the build and probe shuffles. Build and probe run interleaved on each
-/// worker — claim a partition, build its HT, probe it, materialise output,
-/// then claim the next partition. Per-worker per-phase ns accumulators
-/// drive the phase-time aggregation described in the spec.
-PhjResult runPHJ(const ColumnSet & build_cs, const ColumnSet & probe_cs, const RadixConfig & cfg, size_t threads);
+/// Radix-partitioned hash join with work-stealing per-partition
+/// scheduling. `cfg` configures the partition fanout (and optional
+/// multi-pass) for both the build and probe shuffles. Build and probe
+/// run interleaved on each worker — claim a partition, build its HT
+/// from the partition's `BlockStore`, probe it block-by-block,
+/// materialise output, then claim the next partition.
+PhjResult runPHJ(const BlockStream & build, const BlockStream & probe, const RadixConfig & cfg, size_t threads);
 
 }

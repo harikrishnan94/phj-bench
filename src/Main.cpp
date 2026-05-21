@@ -1,4 +1,3 @@
-#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <vector>
@@ -24,22 +23,23 @@ int main(int argc, char ** argv)
         return 0;
     const Options & opts = *maybe;
 
-    /// -------- Generate data once --------
+    /// -------- Generate data once (outside the measured window) --------
     const TimePoint t_gen0 = now();
-    ColumnSet build_cs = generateBuild(opts.build_rows, opts.build_schema, opts.seed, opts.threads);
-    ColumnSet probe_cs = generateProbe(opts.probe_rows, opts.probe_schema, opts.seed, build_cs.keyData(), build_cs.rows, opts.threads);
+    BlockStream build = generateBuild(opts.build_rows, opts.build_schema, opts.seed, opts.threads);
+    BlockStream probe = generateProbe(opts.probe_rows, opts.probe_schema, opts.seed, build, opts.threads);
     const TimePoint t_gen1 = now();
     const double gen_ms = toMillis(t_gen1 - t_gen0);
 
     std::cerr << "[info] data generation: " << gen_ms << " ms"
-              << "  (build_rows=" << opts.build_rows << ", probe_rows=" << opts.probe_rows << ", threads=" << opts.threads << ")\n";
+              << "  (build_rows=" << opts.build_rows << ", probe_rows=" << opts.probe_rows << ", threads=" << opts.threads
+              << ", blocks(build)=" << build.blocks.size() << ", blocks(probe)=" << probe.blocks.size() << ")\n";
 
     /// -------- Optional reference --------
     std::vector<std::string> reference;
     if (opts.check)
     {
         const TimePoint t_ref0 = now();
-        reference = referenceOutput(build_cs, probe_cs);
+        reference = referenceOutput(build, probe);
         const TimePoint t_ref1 = now();
         std::cerr << "[info] reference build: " << toMillis(t_ref1 - t_ref0) << " ms"
                   << "  (output_rows=" << reference.size() << ")\n";
@@ -57,9 +57,9 @@ int main(int argc, char ** argv)
         chj_reps.reserve(opts.reps);
         for (size_t r = 0; r < opts.reps; ++r)
         {
-            ChjResult res = runCHJ(build_cs, probe_cs, opts.threads);
-            std::cerr << "[info] CHJ rep " << r << ": build " << res.build.wall_ms << " ms, probe " << res.probe.wall_ms << " ms, out_rows "
-                      << res.output.totalRows() << "\n";
+            ChjResult res = runCHJ(build, probe, opts.threads);
+            std::cerr << "[info] CHJ rep " << r << ": build " << res.build.wall_ms << " ms, probe " << res.probe.wall_ms << " ms, e2e "
+                      << res.e2e_wall_ms << " ms, out_rows " << res.output.totalRows() << "\n";
             chj_reps.push_back(std::move(res));
         }
     }
@@ -69,10 +69,10 @@ int main(int argc, char ** argv)
         phj_reps.reserve(opts.reps);
         for (size_t r = 0; r < opts.reps; ++r)
         {
-            PhjResult res = runPHJ(build_cs, probe_cs, opts.radix, opts.threads);
+            PhjResult res = runPHJ(build, probe, opts.radix, opts.threads);
             std::cerr << "[info] PHJ rep " << r << ": shuffle " << res.build_shuffle.wall_ms << "/" << res.probe_shuffle.wall_ms
-                      << " ms, build " << res.build.wall_ms << " ms, probe " << res.probe.wall_ms << " ms, out_rows "
-                      << res.output.totalRows() << "\n";
+                      << " ms, build " << res.build.wall_ms << " ms, probe " << res.probe.wall_ms << " ms, e2e " << res.e2e_wall_ms
+                      << " ms, out_rows " << res.output.totalRows() << "\n";
             phj_reps.push_back(std::move(res));
         }
     }

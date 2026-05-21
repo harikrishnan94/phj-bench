@@ -3,32 +3,60 @@
 #include <cstddef>
 #include <vector>
 
-#include "ColumnStorage.h"
+#include "Block.h"
+#include "Types.h"
 
 
 namespace phj
 {
 
-/// Per-worker append-only column-major output buffers. Each matched row
-/// pair produced by probe materialisation writes one entry to the keys
-/// chain, one entry per left (build) payload chain, and one entry per
-/// right (probe) payload chain.
+/// Probe-side output: one composite block of matched rows. Holds the
+/// join key column, the left (build-side) payload columns, and the
+/// right (probe-side) payload columns, all column-major and all `rows`
+/// long. Probe emits these block-by-block when the in-progress block
+/// fills to ~10K rows.
+struct OutputBlock
+{
+    size_t rows = 0;
+    std::vector<uint64_t> keys;
+    std::vector<Column> left;
+    std::vector<Column> right;
+
+    void init(const PayloadSchema & left_schema, const PayloadSchema & right_schema, size_t capacity)
+    {
+        rows = 0;
+        keys.assign(capacity, 0);
+        left.assign(left_schema.types.size(), {});
+        for (size_t c = 0; c < left_schema.types.size(); ++c)
+        {
+            left[c].type = left_schema.types[c];
+            left[c].data.assign(capacity * payloadTypeSize(left_schema.types[c]), std::byte{});
+        }
+        right.assign(right_schema.types.size(), {});
+        for (size_t c = 0; c < right_schema.types.size(); ++c)
+        {
+            right[c].type = right_schema.types[c];
+            right[c].data.assign(capacity * payloadTypeSize(right_schema.types[c]), std::byte{});
+        }
+    }
+};
+
+
+/// Per-worker append-only stream of probe-output blocks. The probe
+/// operator maintains one in-progress `OutputBlock` of capacity
+/// `PIPELINE_BLOCK_ROWS`, flushing it onto `blocks` whenever it fills.
+/// At end-of-stream the in-progress block is flushed (truncated to its
+/// actual filled row count).
 struct OutputWorker
 {
-    KeyBufferChain keys;
-    std::vector<PayloadBufferChain> left;
-    std::vector<PayloadBufferChain> right;
+    std::vector<OutputBlock> blocks;
 
-    void init(const PayloadSchema & l, const PayloadSchema & r)
+    [[nodiscard]] size_t totalRows() const noexcept
     {
-        left.clear();
-        right.clear();
-        left.reserve(l.types.size());
-        right.reserve(r.types.size());
-        for (auto t : l.types)
-            left.emplace_back(t);
-        for (auto t : r.types)
-            right.emplace_back(t);
+        size_t s = 0;
+        for (const auto & b : blocks)
+            s += b.rows;
+        return s;
     }
 };
 
@@ -43,7 +71,7 @@ struct JoinOutput
     {
         size_t s = 0;
         for (const auto & w : workers)
-            s += w.keys.rows;
+            s += w.totalRows();
         return s;
     }
 };

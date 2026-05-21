@@ -10,10 +10,11 @@
 namespace phj
 {
 
-/// CH-style two-level hashtable: 256 sub-tables, top 8 hash bits select the
-/// sub-table. Each sub-table has its own mutex and resizes independently.
-/// `insertLocked` is the parallel-safe insert path; `find` is mutex-free
-/// (assumes the table is read-only after the global build/probe barrier).
+/// CH-style two-level hashtable: 256 sub-tables, top 8 hash bits select
+/// the sub-table. Each sub-table has its own mutex and resizes
+/// independently. `insertLocked` is the parallel-safe insert path;
+/// `find` is mutex-free (assumes the table is read-only after the
+/// global build/probe barrier).
 class TwoLevelJoinHashTable
 {
 public:
@@ -22,21 +23,26 @@ public:
 
     using Hash = JoinHashTable::Hash;
     using Key = JoinHashTable::Key;
-    using Row = JoinHashTable::Row;
+    using Ref = JoinHashTable::Ref;
 
     [[gnu::always_inline]] static constexpr size_t bucketOf(Hash h) noexcept { return static_cast<size_t>(h >> 56); }
 
-    [[gnu::always_inline]] Row insertLocked(Hash h, Key k, Row r)
+    [[gnu::always_inline]] Ref insertLocked(Hash h, Key k, Ref r)
     {
         const size_t b = bucketOf(h);
         const std::scoped_lock lock(mutexes[b]);
         return subs[b].insert(h, k, r);
     }
 
-    [[gnu::always_inline]] Row find(Hash h, Key k) const noexcept { return subs[bucketOf(h)].find(h, k); }
+    [[gnu::always_inline]] Ref find(Hash h, Key k) const noexcept { return subs[bucketOf(h)].find(h, k); }
 
-    JoinHashTable & sub(size_t i) noexcept { return subs[i]; }
-    const JoinHashTable & sub(size_t i) const noexcept { return subs[i]; }
+    /// Batched find. Mutex-free (assumes post-barrier read-only state).
+    /// Open-addressing probe sequences remain per-cell.
+    void batchFind(const Hash * hashes, const Key * keys, Ref * out, size_t n) const noexcept
+    {
+        for (size_t i = 0; i < n; ++i)
+            out[i] = find(hashes[i], keys[i]);
+    }
 
 private:
     std::array<JoinHashTable, SUB_TABLES> subs;

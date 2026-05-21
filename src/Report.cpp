@@ -1,7 +1,6 @@
 #include "Report.h"
 
 #include <algorithm>
-#include <array>
 #include <fstream>
 #include <iomanip>
 #include <ios>
@@ -54,7 +53,7 @@ struct Row
 };
 
 
-void printSchemeTable(std::ostream & os, const std::string & scheme, const std::vector<Row> & rows)
+void printSchemeTable(std::ostream & os, const std::string & scheme, const std::vector<Row> & rows, Stats e2e_ms)
 {
     os << "\nScheme: " << scheme << "\n";
 
@@ -87,23 +86,37 @@ void printSchemeTable(std::ostream & os, const std::string & scheme, const std::
         writeCell(formatDouble(r.ns_per_row.max, 2));
         os << "\n";
     }
+    if (e2e_ms.present)
+    {
+        writePhase("e2e_wall_ms");
+        writeCell(formatDouble(e2e_ms.med));
+        writeCell(formatDouble(e2e_ms.min));
+        writeCell(formatDouble(e2e_ms.max));
+        writeCell("");
+        writeCell("");
+        writeCell("");
+        os << "\n";
+    }
     os << std::string(16 + COL_WIDTH * 6, '-') << "\n";
 }
 
 
-std::vector<Row> chjRows(const std::vector<ChjResult> & reps)
+std::vector<Row> chjRows(const std::vector<ChjResult> & reps, Stats & e2e_out)
 {
-    auto build_ms = std::vector<double>{};
-    auto build_ns = std::vector<double>{};
-    auto probe_ms = std::vector<double>{};
-    auto probe_ns = std::vector<double>{};
+    std::vector<double> build_ms;
+    std::vector<double> build_ns;
+    std::vector<double> probe_ms;
+    std::vector<double> probe_ns;
+    std::vector<double> e2e_ms;
     for (const auto & r : reps)
     {
         build_ms.push_back(r.build.wall_ms);
         build_ns.push_back(r.build.ns_per_row);
         probe_ms.push_back(r.probe.wall_ms);
         probe_ns.push_back(r.probe.ns_per_row);
+        e2e_ms.push_back(r.e2e_wall_ms);
     }
+    e2e_out = computeStats(e2e_ms);
     return {
         {"build", computeStats(build_ms), computeStats(build_ns)},
         {"probe", computeStats(probe_ms), computeStats(probe_ns)},
@@ -111,7 +124,7 @@ std::vector<Row> chjRows(const std::vector<ChjResult> & reps)
 }
 
 
-std::vector<Row> phjRows(const std::vector<PhjResult> & reps)
+std::vector<Row> phjRows(const std::vector<PhjResult> & reps, Stats & e2e_out)
 {
     std::vector<double> bs_ms;
     std::vector<double> bs_ns;
@@ -121,6 +134,7 @@ std::vector<Row> phjRows(const std::vector<PhjResult> & reps)
     std::vector<double> ps_ns;
     std::vector<double> p_ms;
     std::vector<double> p_ns;
+    std::vector<double> e2e_ms;
     for (const auto & r : reps)
     {
         bs_ms.push_back(r.build_shuffle.wall_ms);
@@ -131,7 +145,9 @@ std::vector<Row> phjRows(const std::vector<PhjResult> & reps)
         ps_ns.push_back(r.probe_shuffle.ns_per_row);
         p_ms.push_back(r.probe.wall_ms);
         p_ns.push_back(r.probe.ns_per_row);
+        e2e_ms.push_back(r.e2e_wall_ms);
     }
+    e2e_out = computeStats(e2e_ms);
     return {
         {"build-shuffle", computeStats(bs_ms), computeStats(bs_ns)},
         {"build", computeStats(b_ms), computeStats(b_ns)},
@@ -178,9 +194,17 @@ void printSummary(std::ostream & os, const Options & opts, const std::vector<Chj
     os << "  seed:                   " << opts.seed << "\n";
 
     if (!chj_reps.empty())
-        printSchemeTable(os, "CHJ", chjRows(chj_reps));
+    {
+        Stats e2e;
+        auto rows = chjRows(chj_reps, e2e);
+        printSchemeTable(os, "CHJ", rows, e2e);
+    }
     if (!phj_reps.empty())
-        printSchemeTable(os, "PHJ", phjRows(phj_reps));
+    {
+        Stats e2e;
+        auto rows = phjRows(phj_reps, e2e);
+        printSchemeTable(os, "PHJ", rows, e2e);
+    }
 }
 
 
@@ -195,7 +219,8 @@ void writeCsv(
     {
         f << "scheme,rep,threads,build_rows,probe_rows,build_payload_schema,probe_payload_schema,partitions,distribution,match_rate,"
              "build_wall_ms,build_ns_per_row,probe_wall_ms,probe_ns_per_row,"
-             "build_shuffle_wall_ms,build_shuffle_ns_per_row,probe_shuffle_wall_ms,probe_shuffle_ns_per_row\n";
+             "build_shuffle_wall_ms,build_shuffle_ns_per_row,probe_shuffle_wall_ms,probe_shuffle_ns_per_row,"
+             "e2e_wall_ms\n";
     }
 
     const std::string bsch = schemaToString(opts.build_schema);
@@ -212,7 +237,7 @@ void writeCsv(
         const auto & r = chj_reps[i];
         writeCommon("CHJ", i);
         f << r.build.wall_ms << ',' << r.build.ns_per_row << ',' << r.probe.wall_ms << ',' << r.probe.ns_per_row << ',' << ',' << ',' << ','
-          << '\n';
+          << ',' << r.e2e_wall_ms << '\n';
     }
     for (size_t i = 0; i < phj_reps.size(); ++i)
     {
@@ -220,7 +245,7 @@ void writeCsv(
         writeCommon("PHJ", i);
         f << r.build.wall_ms << ',' << r.build.ns_per_row << ',' << r.probe.wall_ms << ',' << r.probe.ns_per_row << ','
           << r.build_shuffle.wall_ms << ',' << r.build_shuffle.ns_per_row << ',' << r.probe_shuffle.wall_ms << ','
-          << r.probe_shuffle.ns_per_row << '\n';
+          << r.probe_shuffle.ns_per_row << ',' << r.e2e_wall_ms << '\n';
     }
 }
 

@@ -2,13 +2,16 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 
 namespace phj
 {
 
-using RowIndex = uint32_t;
-inline constexpr RowIndex INVALID_ROW = ~RowIndex{0};
+using BlockNo = uint32_t;
+using RowNo = uint32_t;
+
+inline constexpr BlockNo INVALID_BLOCK = ~BlockNo{0};
 
 
 struct UInt128
@@ -67,14 +70,41 @@ inline constexpr const char * payloadTypeName(PayloadType t) noexcept
 }
 
 
-/// Reference into externally-owned column-major payload storage.
-/// Stored alongside the key in the hashtable cell. Holds the head row
-/// index of the multi-match chain; the next-row pointers live in an
-/// external array.
+struct PayloadSchema
+{
+    std::vector<PayloadType> types;
+
+    [[nodiscard]] size_t rowByteSize() const noexcept
+    {
+        size_t s = 0;
+        for (auto t : types)
+            s += payloadTypeSize(t);
+        return s;
+    }
+};
+
+
+/// Position of a build-side row in the build-side block store.
+/// Cells in the hashtable hold one of these alongside the key. `block_no`
+/// indexes into the partition's (PHJ) or the shared (CHJ) Vector<Block>
+/// and `row_no` is the within-block row index. An empty cell is signalled
+/// by `block_no == INVALID_BLOCK`.
 struct RowRefCell
 {
-    RowIndex row_idx = INVALID_ROW;
+    BlockNo block_no = INVALID_BLOCK;
+    RowNo row_no = 0;
+
+    [[nodiscard]] bool valid() const noexcept { return block_no != INVALID_BLOCK; }
 };
-static_assert(sizeof(RowRefCell) == 4);
+static_assert(sizeof(RowRefCell) == 8);
+
+inline constexpr RowRefCell INVALID_REF{INVALID_BLOCK, 0};
+
+
+/// Pipeline block size in rows. The data generator emits blocks of this
+/// size; the radix partition, build, and probe operators consume input
+/// blocks of this size as their batch unit; the probe operator emits
+/// output blocks of (up to) this size.
+inline constexpr size_t PIPELINE_BLOCK_ROWS = 10'000;
 
 }

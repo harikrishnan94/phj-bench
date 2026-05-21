@@ -1,78 +1,35 @@
 #include "CHJ.h"
 
-#include <cstring>
 #include <vector>
 
-#include "Hash.h"
+#include "BlockStore.h"
+#include "JoinOps.h"
 #include "Threading.h"
 #include "Timer.h"
 #include "TwoLevelHashTable.h"
-#include "Types.h"
 
 
 namespace phj
 {
 
-namespace
-{
-
-[[gnu::always_inline]] inline void copySized(std::byte * dst, const std::byte * src, size_t sz) noexcept
-{
-    switch (sz)
-    {
-        case 1:
-            *dst = *src;
-            return;
-        case 2:
-            std::memcpy(dst, src, 2);
-            return;
-        case 4:
-            std::memcpy(dst, src, 4);
-            return;
-        case 8:
-            std::memcpy(dst, src, 8);
-            return;
-        case 16:
-            std::memcpy(dst, src, 16);
-            return;
-        default:
-            std::memcpy(dst, src, sz);
-            return;
-    }
-}
-
-}
-
-
-ChjResult runCHJ(const ColumnSet & build_cs, const ColumnSet & probe_cs, size_t threads)
+ChjResult runCHJ(const BlockStream & build, const BlockStream & probe, size_t threads)
 {
     if (threads == 0)
         threads = 1;
 
     ChjResult result;
-    result.output.left_schema = build_cs.schema;
-    result.output.right_schema = probe_cs.schema;
+    result.output.left_schema = build.schema;
+    result.output.right_schema = probe.schema;
     result.output.workers.resize(threads);
-    for (auto & w : result.output.workers)
-        w.init(build_cs.schema, probe_cs.schema);
 
+    BlockStore store;
+    store.reserveBlocks(build.blocks.size());
     TwoLevelJoinHashTable ht;
-    std::vector<RowIndex> next_row_idx(build_cs.rows, INVALID_ROW);
-
-    /// Pre-sizing is NOT done: the spec says CHJ does not use reserve.
-    /// Sub-tables resize independently as inserts arrive.
-
-    const size_t left_n = build_cs.schema.types.size();
-    const size_t right_n = probe_cs.schema.types.size();
-    std::vector<size_t> left_sizes(left_n);
-    std::vector<size_t> right_sizes(right_n);
-    for (size_t c = 0; c < left_n; ++c)
-        left_sizes[c] = payloadTypeSize(build_cs.schema.types[c]);
-    for (size_t c = 0; c < right_n; ++c)
-        right_sizes[c] = payloadTypeSize(probe_cs.schema.types[c]);
 
     std::vector<uint64_t> build_ns(threads, 0);
     std::vector<uint64_t> probe_ns(threads, 0);
+
+    const TimePoint t_e2e0 = now();
 
     /// -------- BUILD --------
     const TimePoint t_build0 = now();
@@ -82,16 +39,21 @@ ChjResult runCHJ(const ColumnSet & build_cs, const ColumnSet & probe_cs, size_t 
         [&](size_t tid)
         {
             const TimePoint t0 = now();
-            const size_t start = (build_cs.rows * tid) / threads;
-            const size_t end = (build_cs.rows * (tid + 1)) / threads;
-            const uint64_t * keys = build_cs.keyData();
-            RowIndex * next = next_row_idx.data();
-            for (size_t i = start; i < end; ++i)
+            const size_t n = build.blocks.size();
+            const size_t start = (n * tid) / threads;
+            const size_t end = (n * (tid + 1)) / threads;
+            std::vector<uint64_t> hashes;
+            for (size_t b = start; b < end; ++b)
             {
-                const uint64_t k = keys[i];
-                const uint64_t h = intHash64(k);
-                const RowIndex prev = ht.insertLocked(h, k, static_cast<RowIndex>(i));
-                next[i] = prev;
+                /// We need a mutable copy to move into the store. The
+                /// underlying source `build.blocks` stays intact across
+                /// reps (and across the optional --check pass), so we
+                /// deep-copy at block granularity here. This is the
+                /// "append the block to the build-side block store"
+                /// step in the spec; the build store ultimately owns
+                /// the block's storage.
+                Block clone = build.blocks[b];
+                buildOneBlock(std::move(clone), store, ht, hashes);
             }
             build_ns[tid] = toNanos(now() - t0);
         });
@@ -106,39 +68,27 @@ ChjResult runCHJ(const ColumnSet & build_cs, const ColumnSet & probe_cs, size_t 
         [&](size_t tid)
         {
             const TimePoint t0 = now();
-            const size_t start = (probe_cs.rows * tid) / threads;
-            const size_t end = (probe_cs.rows * (tid + 1)) / threads;
-            const uint64_t * keys = probe_cs.keyData();
-            const RowIndex * next = next_row_idx.data();
+            const size_t n = probe.blocks.size();
+            const size_t start = (n * tid) / threads;
+            const size_t end = (n * (tid + 1)) / threads;
 
-            std::vector<const std::byte *> left_bases(left_n);
-            for (size_t c = 0; c < left_n; ++c)
-                left_bases[c] = build_cs.payloads[c].data.get();
-            std::vector<const std::byte *> right_bases(right_n);
-            for (size_t c = 0; c < right_n; ++c)
-                right_bases[c] = probe_cs.payloads[c].data.get();
+            ProbeMaterialiser mat;
+            mat.init(build.schema, probe.schema, result.output.workers[tid], PIPELINE_BLOCK_ROWS);
 
-            OutputWorker & ow = result.output.workers[tid];
+            std::vector<uint64_t> hashes;
+            std::vector<RowRefCell> heads;
+            std::vector<size_t> probe_idx;
+            std::vector<RowRefCell> build_ref;
 
-            for (size_t i = start; i < end; ++i)
-            {
-                const uint64_t k = keys[i];
-                const uint64_t h = intHash64(k);
-                RowIndex r = ht.find(h, k);
-                while (r != INVALID_ROW)
-                {
-                    *ow.keys.nextSlot() = k;
-                    for (size_t c = 0; c < left_n; ++c)
-                        copySized(ow.left[c].nextSlot(), left_bases[c] + static_cast<size_t>(r) * left_sizes[c], left_sizes[c]);
-                    for (size_t c = 0; c < right_n; ++c)
-                        copySized(ow.right[c].nextSlot(), right_bases[c] + i * right_sizes[c], right_sizes[c]);
-                    r = next[r];
-                }
-            }
+            for (size_t b = start; b < end; ++b)
+                probeOneBlock(probe.blocks[b].view(), store, ht, mat, hashes, heads, probe_idx, build_ref);
+
+            mat.finish();
             probe_ns[tid] = toNanos(now() - t0);
         });
 
     const TimePoint t_probe1 = now();
+    const TimePoint t_e2e1 = t_probe1;
 
     uint64_t sum_build_ns = 0;
     for (auto v : build_ns)
@@ -148,9 +98,10 @@ ChjResult runCHJ(const ColumnSet & build_cs, const ColumnSet & probe_cs, size_t 
         sum_probe_ns += v;
 
     result.build.wall_ms = toMillis(t_build1 - t_build0);
-    result.build.ns_per_row = build_cs.rows == 0 ? 0.0 : static_cast<double>(sum_build_ns) / static_cast<double>(build_cs.rows);
+    result.build.ns_per_row = build.total_rows == 0 ? 0.0 : static_cast<double>(sum_build_ns) / static_cast<double>(build.total_rows);
     result.probe.wall_ms = toMillis(t_probe1 - t_probe0);
-    result.probe.ns_per_row = probe_cs.rows == 0 ? 0.0 : static_cast<double>(sum_probe_ns) / static_cast<double>(probe_cs.rows);
+    result.probe.ns_per_row = probe.total_rows == 0 ? 0.0 : static_cast<double>(sum_probe_ns) / static_cast<double>(probe.total_rows);
+    result.e2e_wall_ms = toMillis(t_e2e1 - t_e2e0);
 
     return result;
 }

@@ -355,18 +355,4 @@ std::string schemaToString(const PayloadSchema & s)
 }
 
 
-const char * schemeName(SchemeChoice s)
-{
-    switch (s)
-    {
-        case SchemeChoice::CHJ:
-            return "CHJ";
-        case SchemeChoice::PHJ:
-            return "PHJ";
-        case SchemeChoice::Both:
-            return "BOTH";
-    }
-    return "?";
-}
-
 }

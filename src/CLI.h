@@ -5,8 +5,8 @@
 #include <optional>
 #include <string>
 
-#include "ColumnStorage.h"
 #include "RadixPartition.h"
+#include "Types.h"
 
 
 namespace phj
@@ -43,7 +43,5 @@ std::optional<Options> parseCli(int argc, char ** argv, bool * ok);
 
 
 std::string schemaToString(const PayloadSchema & s);
-
-const char * schemeName(SchemeChoice s);
 
 }

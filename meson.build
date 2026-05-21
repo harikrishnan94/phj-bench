@@ -34,6 +34,17 @@ add_project_arguments(
     language: 'cpp',
 )
 
+cpp = meson.get_compiler('cpp')
+avx512_args = [
+    '-mavx512f',
+    '-mavx512dq',
+    '-mavx512bw',
+    '-mavx512vl',
+]
+if cpp.has_multi_arguments(avx512_args)
+    add_project_arguments(avx512_args, language: 'cpp')
+endif
+
 threads_dep = dependency('threads')
 
 subdir('src')

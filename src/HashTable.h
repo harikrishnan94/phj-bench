@@ -1,7 +1,6 @@
 #pragma once
 
 #include <bit>
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -14,24 +13,24 @@ namespace phj
 {
 
 /// Open-addressing linear-probe join hashtable. Cells are 16 bytes:
-/// (key, RowRefCell). Multi-match chaining is the caller's responsibility
-/// via an external `next_row_idx` array; the HT records only the head row
-/// per key. Resize uses `intHash64(key)` to recompute positions; both join
-/// schemes use the same hash unchanged so this is well-defined.
+/// (key, RowRefCell). Multi-match chaining is the caller's
+/// responsibility via the build-side block store's next-chain matrix;
+/// the HT records only the head `RowRefCell` per key. Resize uses
+/// `intHash64(key)` to recompute positions; both join schemes use the
+/// same hash unchanged so this is well-defined.
 class JoinHashTable
 {
 public:
     using Hash = uint64_t;
     using Key = uint64_t;
-    using Row = RowIndex;
+    using Ref = RowRefCell;
 
     struct Cell
     {
         Key key;
-        RowRefCell ref;
-        uint32_t pad;
+        Ref ref;
     };
-    static_assert(sizeof(Cell) == 16, "Cell expected to be 16 bytes");
+    static_assert(sizeof(Cell) == 16);
 
     JoinHashTable() = default;
     JoinHashTable(const JoinHashTable &) = delete;
@@ -40,68 +39,78 @@ public:
     JoinHashTable & operator=(JoinHashTable &&) noexcept = default;
     ~JoinHashTable() = default;
 
-    /// Pre-size to comfortably hold `expected_rows` entries (target ~50% load).
+    /// Pre-size to comfortably hold `expected_rows` entries (target
+    /// ~50% load).
     void reserve(size_t expected_rows)
     {
-        const size_t want = std::max<size_t>(MIN_CAPACITY, expected_rows * 2);
+        const size_t want = expected_rows * 2;
         const size_t cap = std::bit_ceil(want);
         ensureCapacity(cap);
     }
 
-    /// Insert `key` with row index `row_idx`. Returns the previous head row
-    /// for `key` (INVALID_ROW if this is the first insertion for `key`).
-    /// The caller stores the return value into next_row_idx[row_idx] to
-    /// chain multi-match rows. Triggers grow at 50% load if needed.
-    [[gnu::always_inline]] inline Row insert(Hash hash, Key key, Row row_idx)
+    /// Insert `(key, ref)` keyed on the precomputed `hash`. Returns
+    /// the previous head ref for `key` (INVALID_REF if this is the
+    /// first insertion for `key`). The caller stores the return value
+    /// into the block store's next-chain at `ref` to thread multi-
+    /// match rows. Triggers grow at 50% load if needed.
+    [[gnu::always_inline]] inline Ref insert(Hash hash, Key key, Ref ref)
     {
         if (num_cells * 2 >= cells.size()) [[unlikely]]
-            ensureCapacity(cells.empty() ? MIN_CAPACITY : cells.size() * 2);
+            ensureCapacity(cells.empty() ? DEFAULT_CAPACITY : cells.size() * 2);
 
         const size_t mask = cells.size() - 1;
         size_t pos = static_cast<size_t>(hash) & mask;
         while (true)
         {
             Cell & c = cells[pos];
-            if (c.ref.row_idx == INVALID_ROW)
+            if (!c.ref.valid())
             {
                 c.key = key;
-                c.ref.row_idx = row_idx;
+                c.ref = ref;
                 ++num_cells;
-                return INVALID_ROW;
+                return INVALID_REF;
             }
             if (c.key == key)
             {
-                const Row prev = c.ref.row_idx;
-                c.ref.row_idx = row_idx;
+                const Ref prev = c.ref;
+                c.ref = ref;
                 return prev;
             }
             pos = (pos + 1) & mask;
         }
     }
 
-    /// Find the head row index for `key`, or INVALID_ROW if not present.
-    [[gnu::always_inline]] inline Row find(Hash hash, Key key) const noexcept
+    /// Find the head ref for `key`, or INVALID_REF if not present.
+    [[gnu::always_inline]] inline Ref find(Hash hash, Key key) const noexcept
     {
         if (cells.empty()) [[unlikely]]
-            return INVALID_ROW;
+            return INVALID_REF;
         const size_t mask = cells.size() - 1;
         size_t pos = static_cast<size_t>(hash) & mask;
         while (true)
         {
             const Cell & c = cells[pos];
-            if (c.ref.row_idx == INVALID_ROW)
-                return INVALID_ROW;
+            if (!c.ref.valid())
+                return INVALID_REF;
             if (c.key == key)
-                return c.ref.row_idx;
+                return c.ref;
             pos = (pos + 1) & mask;
         }
     }
 
-    [[nodiscard]] size_t size() const noexcept { return num_cells; }
-    [[nodiscard]] size_t capacity() const noexcept { return cells.size(); }
+    /// Batched find: for each `i` in `[0, n)`, write the head ref for
+    /// `keys[i]` (keyed on `hashes[i]`) to `out[i]`. Operates one row
+    /// at a time internally; the batch interface is the caller-visible
+    /// dispatch granularity, not a SIMD primitive — open-addressing
+    /// probe sequences remain per-cell.
+    void batchFind(const Hash * hashes, const Key * keys, Ref * out, size_t n) const noexcept
+    {
+        for (size_t i = 0; i < n; ++i)
+            out[i] = find(hashes[i], keys[i]);
+    }
 
 private:
-    static constexpr size_t MIN_CAPACITY = 256 * 1024;
+    static constexpr size_t DEFAULT_CAPACITY = 128 * 1024;
 
     std::vector<Cell> cells;
     size_t num_cells = 0;
@@ -111,16 +120,16 @@ private:
         if (new_cap <= cells.size())
             return;
         std::vector<Cell> old_cells = std::move(cells);
-        cells.assign(new_cap, Cell{0, RowRefCell{INVALID_ROW}, 0});
+        cells.assign(new_cap, Cell{0, INVALID_REF});
         num_cells = 0;
         const size_t new_mask = new_cap - 1;
         for (Cell & oc : old_cells)
         {
-            if (oc.ref.row_idx == INVALID_ROW)
+            if (!oc.ref.valid())
                 continue;
             const uint64_t h = intHash64(oc.key);
             size_t pos = static_cast<size_t>(h) & new_mask;
-            while (cells[pos].ref.row_idx != INVALID_ROW)
+            while (cells[pos].ref.valid())
                 pos = (pos + 1) & new_mask;
             cells[pos] = oc;
             ++num_cells;
