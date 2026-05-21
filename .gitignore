@@ -1,0 +1,10 @@
+build/
+build-*/
+*.o
+*.a
+*.so
+*.dSYM/
+compile_commands.json
+.cache/
+.vscode/
+.idea/
