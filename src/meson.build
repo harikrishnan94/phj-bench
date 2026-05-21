@@ -3,6 +3,7 @@ phj_bench_sources = [
     'RadixPartition.cpp',
     'CHJ.cpp',
     'PHJ.cpp',
+    'PHJBep.cpp',
     'Reference.cpp',
     'Report.cpp',
     'CLI.cpp',

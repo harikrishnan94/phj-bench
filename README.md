@@ -1,8 +1,8 @@
 # phj-bench
 
-Standalone benchmark harness comparing two parallel hash-join strategies on
-a shared CH-style primitive hashtable, so the difference attributable to
-partitioning strategy is isolated.
+Standalone benchmark harness comparing three parallel hash-join strategies
+on a shared CH-style primitive hashtable, so the difference attributable
+to partitioning strategy is isolated.
 
 - **CHJ** — concurrent hash join (ClickHouse-style): a 256-way two-level
   hashtable. The top 8 bits of the key hash select the sub-table; each
@@ -13,11 +13,32 @@ partitioning strategy is isolated.
   partitions form a work-stealing queue. Each worker claims a partition,
   builds its hashtable, probes it block-by-block, materialises matched
   output, then claims the next.
+- **PHJ-BEP** — best-effort partitioning hash join (Zukowski, Héman,
+  Boncz; *Architecture-Conscious Hashing*, DaMoN 2006, §3.1,
+  Algorithm 1). Build side is identical to PHJ (radix-shuffled to full
+  leaf depth via `--partitions` × `--passes`), but per-leaf HT
+  construction is deferred. Probe is per-thread, single-pass over its
+  slice of probe input. Each incoming block is scattered through pass 1
+  only into per-worker unrefined chains. At every input-block boundary
+  the worker checks whether its buffered probe bytes have reached the
+  per-worker budget M (`--bep-budget-mib`, default 32). If so, the
+  largest buffered partition is selected; unrefined targets are force-
+  refined to leaves on the spot (passes 2..N); leaf targets are built
+  (lazily, once per leaf across the whole run via a `NOT_BUILT` →
+  `BUILDING` → `BUILT` CAS state machine), probed, and dropped. At end
+  of input the remaining non-empty partitions are drained.
 
-Both schemes use the same open-addressing `JoinHashTable` primitive
-(cells of `(key, RowRefCell)`), the same `intHash64` mix function, and
-the same `RowRefCell` row reference. Build-side payloads live in a
-`BlockStore`; the hashtable carries only `(block_no, row_no)`.
+All three schemes use the same open-addressing `JoinHashTable`
+primitive (cells of `(key, RowRefCell)`), the same `intHash64` mix
+function, and the same `RowRefCell` row reference. Build-side payloads
+live in a `BlockStore`; the hashtable carries only `(block_no, row_no)`.
+PHJ-BEP reuses the multi-pass radix partition operator (in `scatter_pass1`
+and `refine_to_leaves` modes), the per-leaf HT construction routine,
+`process_partition`, the build-shuffle code path, the output sink, and
+the thread pool — it adds only the per-thread BEP probe loop, the
+per-thread byte accounting, the per-leaf HT state machine, the
+structural unrefined/leaf distinction on the probe side, and the BEP-
+specific timing/metrics layout.
 
 ## Pipeline architecture
 
@@ -64,12 +85,13 @@ matrix for multi-match traversal.
 | `src/Threading.h`                     | `parallelRun(threads, fn)` spawn/join helper            |
 | `src/HashTable.h`                     | Open-addressing primitive (Cell holds `RowRefCell`)     |
 | `src/TwoLevelHashTable.h`             | 256-way wrapper with per-sub-table mutex                |
-| `src/RadixPartition.{h,cpp}`          | Block-pipelined radix shuffle, doubling OutBlock chains |
-| `src/Probe.h`                         | Probe-side column-major projection materialiser         |
+| `src/RadixPartition.{h,cpp}`          | Radix shuffle + reusable per-batch scatter primitives   |
+| `src/JoinOps.h`                       | Vectorised build/probe + probe-side projection          |
 | `src/JoinOutput.h`                    | `OutputBlock`, `OutputWorker`, `PhaseTiming`            |
 | `src/DataGen.{h,cpp}`                 | Block-emitting parallel synthetic data generator        |
 | `src/CHJ.{h,cpp}`                     | CHJ scheme: shared store + vectorised build/probe       |
 | `src/PHJ.{h,cpp}`                     | PHJ scheme: per-partition store + work-stealing         |
+| `src/PHJBep.{h,cpp}`                  | PHJ-BEP: bounded probe buffer + lazy per-leaf HT        |
 | `src/Reference.{h,cpp}`               | `std::unordered_map`-based correctness reference        |
 | `src/CLI.{h,cpp}`                     | Argument parser                                         |
 | `src/Report.{h,cpp}`                  | Console table + CSV writer (with `e2e_wall_ms`)         |
@@ -94,20 +116,24 @@ Binary: `build/src/phj-bench`.
 
 ```
 build/src/phj-bench \
-    --scheme both \
+    --scheme all \
     --build-rows 10000000 \
     --probe-rows 10000000 \
     --build-payload-schema u32,u64 \
     --probe-payload-schema u32,u64,u128 \
     --threads 8 \
     --partitions 256 \
+    --bep-budget-mib 32 \
     --reps 5 \
     --seed 42 \
     --csv runs.csv \
     --check
 ```
 
-See `build/src/phj-bench --help` for the full set of options.
+`--scheme` accepts `chj`, `phj`, `phj-bep`, or `all`. `--bep-budget-mib`
+sets the per-worker probe-side buffer budget for PHJ-BEP in mebibytes
+(default 32). See `build/src/phj-bench --help` for the full set of
+options.
 
 The console table is printed unconditionally. CSV is written only when
 `--csv <path>` is provided; the file is appended to if it already
@@ -124,13 +150,46 @@ validation run once around the rep loop.
 For each (scheme, rep) the harness records both wall ms and ns/row per
 phase. The aggregation rules are:
 
-| Phase / Scheme | Wall ms                                | ns/row                                       |
-|----------------|----------------------------------------|----------------------------------------------|
-| CHJ build      | clock span (build barrier)             | sum per-thread phase ns / build_rows         |
-| CHJ probe      | clock span (probe completion)          | sum per-thread phase ns / probe_rows         |
-| PHJ shuffles   | clock span                             | wall ns × threads / rows                     |
-| PHJ build      | max per-worker accumulator             | sum per-worker phase ns / build_rows         |
-| PHJ probe      | max per-worker accumulator             | sum per-worker phase ns / probe_rows         |
+| Phase / Scheme                      | Wall ms                                | ns/row                                       |
+|-------------------------------------|----------------------------------------|----------------------------------------------|
+| CHJ build                           | clock span (build barrier)             | sum per-thread phase ns / build_rows         |
+| CHJ probe                           | clock span (probe completion)          | sum per-thread phase ns / probe_rows         |
+| PHJ shuffles                        | clock span                             | wall ns × threads / rows                     |
+| PHJ build                           | max per-worker accumulator             | sum per-worker phase ns / build_rows         |
+| PHJ probe                           | max per-worker accumulator             | sum per-worker phase ns / probe_rows         |
+| PHJ-BEP build-shuffle               | clock span                             | wall ns × threads / build_rows               |
+| PHJ-BEP build                       | max per-worker accumulator             | sum per-worker phase ns / build_rows         |
+| PHJ-BEP probe-shuffle               | max per-worker accumulator             | sum per-worker phase ns / probe_rows         |
+| PHJ-BEP probe                       | max per-worker accumulator             | sum per-worker phase ns / probe_rows         |
+| PHJ-BEP eviction-overhead           | max per-worker accumulator             | sum per-worker phase ns / probe_rows         |
+
+For PHJ-BEP, the five per-worker accumulators cover:
+
+- `build_shuffle_ns` — global, contiguous wall span of the full multi-
+  pass build-shuffle (identical to PHJ; reported as a single accumulator
+  shared across all workers).
+- `build_ns` — lazy per-leaf HT construction during probe, charged to
+  the worker that won the CAS race for that leaf.
+- `probe_shuffle_ns` — initial pass-1 scatter of incoming probe blocks
+  **plus** refinement scatter of selected partitions (passes 2..N).
+- `probe_ns` — `process_partition`: HT lookup + column-major output
+  projection.
+- `eviction_overhead_ns` — trigger checks, argmax across partitions,
+  state-machine loads/CAS, `BUILDING`-skip / backoff, and buffer-chain
+  teardown.
+
+PHJ-BEP additionally reports the following per-run metrics in the
+console table footer and in the CSV (the columns are blank in the CHJ
+and PHJ rows):
+
+- `bep_budget_mib` — the per-worker buffer budget (CLI input).
+- `bep_evictions` — total leaf evictions across all workers.
+- `bep_refinements` — total forced refinements across all workers
+  (BEP's only refinement trigger is the budget check).
+- `bep_peak_buffered_rows` — max across workers and across the run of
+  total buffered probe rows.
+- `bep_build_skip_retries` — total `BUILDING`-skip events across all
+  workers.
 
 The harness additionally records a single end-to-end wall time per
 scheme per rep:
@@ -139,15 +198,20 @@ scheme per rep:
   probe.
 - **PHJ `e2e_wall_ms`** spans from the start of build-shuffle to the
   end of probe.
+- **PHJ-BEP `e2e_wall_ms`** spans from the start of build-shuffle to
+  the last probe output emitted.
 
 PHJ build and probe interleave per partition under work-stealing; the
 harness keeps per-thread per-phase accumulators inside the worker loop
-so build and probe stay isolated despite interleaving.
+so build and probe stay isolated despite interleaving. PHJ-BEP further
+interleaves refinement, lazy HT construction, probing, and buffer
+teardown on every worker; the five accumulators above isolate each
+contribution.
 
 The console table summarises median, min, and max across reps for each
-metric (including `e2e_wall_ms`). The CSV emits one row per
-(scheme, rep) with an `e2e_wall_ms` column appended after the
-per-phase columns.
+metric (including `e2e_wall_ms`). The CSV emits one row per (scheme,
+rep) with column groups for build/probe, build-shuffle/probe-shuffle,
+eviction-overhead, `e2e_wall_ms`, and the BEP-only per-run metrics.
 
 ## Correctness
 

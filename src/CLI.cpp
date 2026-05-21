@@ -14,13 +14,13 @@ namespace phj
 namespace
 {
 
-const char * USAGE = R"(phj-bench: radix-partitioned vs concurrent hash join benchmark
+const char * USAGE = R"(phj-bench: hash join benchmark (CHJ vs PHJ vs PHJ-BEP)
 
 Usage:
   phj-bench [options]
 
 Options:
-  --scheme {chj|phj|both}        Which scheme(s) to run (default: both).
+  --scheme {chj|phj|phj-bep|all} Which scheme(s) to run (default: all).
   --build-rows N                 Number of build-side rows (default: 1000000).
   --probe-rows N                 Number of probe-side rows (default: 1000000).
   --build-payload-schema LIST    Comma-separated payload types, e.g. u32,u64,u128.
@@ -32,6 +32,9 @@ Options:
   --partition-bits-per-pass LIST Comma-separated bits-per-pass list (overrides
                                  --partitions and --passes). Example: 6,4 ->
                                  1024 partitions in two passes.
+  --bep-budget-mib N             PHJ-BEP per-worker probe buffer budget in MiB
+                                 (default: 32). Only probe input buffer bytes
+                                 (unrefined and leaf chains) count toward it.
   --reps N                       Repetitions per scheme (default: 1).
   --csv PATH                     Write per-rep CSV to this path (optional).
   --check                        Validate outputs against std::unordered_map
@@ -184,13 +187,17 @@ std::optional<Options> parseCli(int argc, char ** argv, bool * ok)
             {
                 opts.scheme = SchemeChoice::PHJ;
             }
-            else if (value == "both")
+            else if (value == "phj-bep")
             {
-                opts.scheme = SchemeChoice::Both;
+                opts.scheme = SchemeChoice::PhjBep;
+            }
+            else if (value == "all")
+            {
+                opts.scheme = SchemeChoice::All;
             }
             else
             {
-                std::cerr << "--scheme must be chj|phj|both\n";
+                std::cerr << "--scheme must be chj|phj|phj-bep|all\n";
                 *ok = false;
                 return std::nullopt;
             }
@@ -290,6 +297,15 @@ std::optional<Options> parseCli(int argc, char ** argv, bool * ok)
             if (!parseUint64(value, opts.seed))
             {
                 std::cerr << "invalid --seed\n";
+                *ok = false;
+                return std::nullopt;
+            }
+        }
+        else if (key == "--bep-budget-mib")
+        {
+            if (!parseUint(value, opts.bep_budget_mib))
+            {
+                std::cerr << "invalid --bep-budget-mib\n";
                 *ok = false;
                 return std::nullopt;
             }

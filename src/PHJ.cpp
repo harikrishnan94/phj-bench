@@ -15,43 +15,6 @@
 namespace phj
 {
 
-namespace
-{
-
-/// Convert one `OutBlock` (from a partition's chain) into a `Block`
-/// suitable for the build operator: same rows, same column-major
-/// layout, with vectors truncated to the actual filled row count.
-/// The OutBlock is consumed (its buffers are moved); the resulting
-/// Block owns the storage that the partition's `BlockStore` will then
-/// retain across the build/probe lifetime.
-Block outBlockToBlock(OutBlock && ob)
-{
-    Block b;
-    b.rows = ob.rows;
-    b.keys = std::move(ob.keys);
-    b.keys.resize(ob.rows);
-    b.payloads.resize(ob.payloads.size());
-    for (size_t c = 0; c < ob.payloads.size(); ++c)
-    {
-        b.payloads[c].type = ob.payloads[c].type;
-        b.payloads[c].data = std::move(ob.payloads[c].data);
-        b.payloads[c].data.resize(ob.rows * payloadTypeSize(b.payloads[c].type));
-    }
-    return b;
-}
-
-
-/// Non-owning view of an OutBlock as a BlockView. The OutBlock's
-/// `keys`/`payloads` buffers may have trailing capacity beyond `rows`;
-/// the view exposes only `rows` worth.
-BlockView viewOf(const OutBlock & ob) noexcept
-{
-    return {ob.rows, ob.keys.data(), ob.payloads.data(), ob.payloads.size()};
-}
-
-}
-
-
 PhjResult runPHJ(const BlockStream & build, const BlockStream & probe, const RadixConfig & cfg, size_t threads)
 {
     if (threads == 0)
@@ -135,7 +98,7 @@ PhjResult runPHJ(const BlockStream & build, const BlockStream & probe, const Rad
                     {
                         if (ob.rows == 0)
                             continue;
-                        probeOneBlock(viewOf(ob), store, ht, mat, probe_hashes, heads, probe_idx, build_ref);
+                        probeOneBlock(ob.view(), store, ht, mat, probe_hashes, heads, probe_idx, build_ref);
                     }
                 }
 
