@@ -55,8 +55,16 @@ enum class LeafState : uint8_t
 ///                        of the same bucket already deposited.
 ///
 /// `unrefined_rows[p1]` and `leaf_rows[l]` mirror each chain's filled
-/// row count; the eviction argmax reads them directly and byte metrics
-/// are derived from `total_rows * bytes_per_row`.
+/// row count; the eviction argmax reads them directly (a chain with
+/// more filled rows is the larger candidate to evict). Byte metrics
+/// driving the budget trigger and per-worker peak are computed from
+/// the chains' OutBlock CAPACITIES, not filled rows: under tight
+/// budgets a chain may hold over-capacity OutBlocks (the radix
+/// scatter's doubling-grow scheme can allocate up to ~1 MiB per
+/// block once `next_cap` has saturated). Using filled rows as the
+/// budget metric under-counts actual memory by up to the doubling
+/// factor and leads to runaway capacity waste; using capacity makes
+/// the budget bound real memory.
 ///
 /// All internal vectors use the supplied memory resource so that
 /// buffer allocations are tracked by the run's MemTracker.
@@ -90,15 +98,66 @@ struct EvictTarget
 };
 
 
-[[gnu::always_inline]] inline size_t bufferedBytes(const WorkerProbeState & s) noexcept
+/// Release the trailing unused capacity of an `OutBlock` by re-
+/// allocating its key and payload buffers at exactly `rows` slots
+/// each. Used after the build shuffle: the radix scatter's doubling-
+/// grow scheme typically over-allocates the last block per (thread,
+/// partition) chain — for a 100M-row build with 2048 partitions and
+/// 16 threads that's ~1.4 GiB of trailing capacity that would
+/// otherwise propagate verbatim into the per-leaf BlockStores
+/// (`outBlockToBlock` does a move, not a shrink). Compacting once
+/// here, immediately after radixShuffle, costs one pass of memcpy
+/// over the build data (parallelisable per chain) and is invisible
+/// to the eviction / probe loops downstream.
+void compactOutBlock(OutBlock & blk)
 {
-    return s.total_rows * s.bytes_per_row;
+    if (blk.rows >= blk.capacity)
+        return;
+    auto * mr = blk.keys.get_allocator().resource();
+    const auto rows_diff = static_cast<std::ptrdiff_t>(blk.rows);
+    std::pmr::vector<uint64_t> new_keys(mr);
+    new_keys.assign(blk.keys.begin(), blk.keys.begin() + rows_diff);
+    blk.keys = std::move(new_keys);
+    for (auto & col : blk.payloads)
+    {
+        const size_t sz = payloadTypeSize(col.type);
+        const auto bytes_diff = static_cast<std::ptrdiff_t>(blk.rows * sz);
+        std::pmr::vector<std::byte> new_data(mr);
+        new_data.assign(col.data.begin(), col.data.begin() + bytes_diff);
+        col.data = std::move(new_data);
+    }
+    blk.capacity = blk.rows;
+}
+
+
+/// Total allocated capacity (in rows) across both unrefined and leaf
+/// chains. Touches every non-empty chain's OutBlocks and reads each
+/// block's `capacity` field. The chains' `blocks` vectors are
+/// per-worker (no contention) and the scan is bounded by the number
+/// of currently-non-empty chains × ~1–3 OutBlocks each — typically
+/// well under 10K reads, all cache-hot per-worker memory.
+[[gnu::always_inline]] inline size_t allocatedCapRows(const WorkerProbeState & s) noexcept
+{
+    size_t cap = 0;
+    for (const auto & po : s.unrefined)
+        for (const auto & blk : po.blocks)
+            cap += blk.capacity;
+    for (const auto & po : s.leaf)
+        for (const auto & blk : po.blocks)
+            cap += blk.capacity;
+    return cap;
+}
+
+
+[[gnu::always_inline]] inline size_t allocatedBytes(const WorkerProbeState & s) noexcept
+{
+    return allocatedCapRows(s) * s.bytes_per_row;
 }
 
 
 [[gnu::always_inline]] inline bool overBudget(const WorkerProbeState & s, size_t budget_bytes) noexcept
 {
-    return bufferedBytes(s) >= budget_bytes;
+    return allocatedBytes(s) >= budget_bytes;
 }
 
 
@@ -153,6 +212,29 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
     /// -------- BUILD SHUFFLE (full leaf depth, same code path as PHJ) --------
     const TimePoint t_bs0 = now();
     PartitionedShuffleOutput build_part = radixShuffle(build, cfg, threads, &tracker);
+
+    /// Compact each chain's trailing partial OutBlock. The radix
+    /// scatter's doubling-grow allocates each `OutBlock` at twice
+    /// the previous block's capacity (capped at `MAX_OUT_BLOCK_ROWS`),
+    /// so the last block per (thread, partition) chain typically
+    /// holds significantly fewer rows than its allocated capacity.
+    /// Without this pass that trailing slack rides through into the
+    /// per-leaf `BlockStore`s (one move per outBlockToBlock(), no
+    /// shrink) and contributes ~1.4 GiB to peak memory on a 100M
+    /// build with 2048 partitions × 16 threads. Done in parallel
+    /// per chain; each `compactOutBlock` is a single allocator-
+    /// preserving copy over the block's filled rows, so the
+    /// transient peak overshoot is bounded by one block's filled
+    /// rows per thread (~MiBs, not GiBs).
+    parallelRun(
+        threads,
+        [&](size_t tid)
+        {
+            const size_t n = build_part.chains.size();
+            for (size_t p = tid; p < n; p += threads)
+                for (auto & blk : build_part.chains[p].blocks)
+                    compactOutBlock(blk);
+        });
     const TimePoint t_bs1 = now();
     const uint64_t build_shuffle_ns = toNanos(t_bs1 - t_bs0);
 
@@ -315,14 +397,30 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                 }
             };
 
+            const size_t initial_block_rows = initialOutBlockRows(probe.schema);
+
             auto dropLeafProbeBuffers = [&](size_t leaf)
             {
                 s.total_rows -= s.leaf_rows[leaf];
                 s.leaf_rows[leaf] = 0;
                 dropPartition(s.leaf[leaf]);
+                /// Reset the doubling-grow progression. Without this
+                /// reset, a leaf that previously grew to a 1 MiB
+                /// OutBlock keeps `next_cap` at `MAX_OUT_BLOCK_ROWS`
+                /// — so the next refinement onto this leaf allocates
+                /// a fresh 1 MiB OutBlock to hold its tiny payload
+                /// (typically ~100 rows when a pass-1 bucket fans out
+                /// across leaves_per_p1 leaves). Across 16 workers ×
+                /// 2048 leaves that pathology compounds into ~30 GiB
+                /// of capacity waste invisible to the filled-row
+                /// budget. Resetting to the initial capacity keeps
+                /// each refill's cap overhead bounded to the
+                /// canonical doubling factor (~2× filled rows worst
+                /// case, ~1.5× on average).
+                s.leaf[leaf].next_cap = initial_block_rows;
             };
 
-            auto bumpPeak = [&]() noexcept { s.peak_bytes = std::max(s.peak_bytes, bufferedBytes(s)); };
+            auto bumpPeak = [&]() noexcept { s.peak_bytes = std::max(s.peak_bytes, allocatedBytes(s)); };
 
             /// Inner eviction loop: invoked at every input-block boundary
             /// (and once at end of input, via the drain phase below).
