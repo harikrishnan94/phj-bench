@@ -55,6 +55,12 @@ int main(int argc, char ** argv)
     const bool run_phj_pure = opts.scheme == SchemeChoice::PhjPure || opts.scheme == SchemeChoice::All;
     const bool run_phj = opts.scheme == SchemeChoice::PHJ || opts.scheme == SchemeChoice::All || opts.scheme == SchemeChoice::Default;
 
+    /// Only the first rep's `output` is consulted post-loop (by `--check`,
+    /// see below). Drop every other rep's materialised output as soon as we
+    /// have logged its row count, so the resident set stays bounded by
+    /// (one output + one scheme's transient peak) regardless of `--reps`.
+    /// At billion-row scales the retained outputs were the dominant cause
+    /// of OOM kills across multi-rep runs.
     if (run_chj)
     {
         chj_reps.reserve(opts.reps);
@@ -63,6 +69,8 @@ int main(int argc, char ** argv)
             ChjResult res = runCHJ(build, probe, opts.threads);
             std::cerr << "[info] CHJ rep " << r << ": build " << res.build.wall_ms << " ms, probe " << res.probe.wall_ms << " ms, e2e "
                       << res.e2e_wall_ms << " ms, out_rows " << res.output.totalRows() << "\n";
+            if (!opts.check || !chj_reps.empty())
+                res.output = JoinOutput{};
             chj_reps.push_back(std::move(res));
         }
     }
@@ -76,6 +84,8 @@ int main(int argc, char ** argv)
             std::cerr << "[info] PHJ-PURE rep " << r << ": shuffle " << res.build_shuffle.wall_ms << "/" << res.probe_shuffle.wall_ms
                       << " ms, build " << res.build.wall_ms << " ms, probe " << res.probe.wall_ms << " ms, e2e " << res.e2e_wall_ms
                       << " ms, out_rows " << res.output.totalRows() << "\n";
+            if (!opts.check || !phj_reps.empty())
+                res.output = JoinOutput{};
             phj_reps.push_back(std::move(res));
         }
     }
@@ -91,8 +101,9 @@ int main(int argc, char ** argv)
                       << res.eviction_overhead.wall_ms << " ms, e2e " << res.e2e_wall_ms << " ms, out_rows " << res.output.totalRows()
                       << ", budget " << res.bep_budget_mib << " MiB, evictions " << res.bep_evictions << ", refinements "
                       << res.bep_refinements << ", bep_peak_mib " << static_cast<double>(res.bep_peak_bytes) / (1024.0 * 1024.0)
-                      << " MiB, skip-retries "
-                      << res.bep_build_skip_retries << "\n";
+                      << " MiB, skip-retries " << res.bep_build_skip_retries << "\n";
+            if (!opts.check || !bep_reps.empty())
+                res.output = JoinOutput{};
             bep_reps.push_back(std::move(res));
         }
     }
