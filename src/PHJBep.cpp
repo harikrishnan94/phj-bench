@@ -467,6 +467,41 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
             worker_skip_retries[tid] = my_skip_retries;
         });
 
+    /// -------- POST-SCATTER HT CLEANUP --------
+    /// parallelRun #1 has joined, so no concurrent reader of `leaf_hts`
+    /// or `leaf_stores` can exist. Eagerly free leaves whose buffered
+    /// probe-side rows were fully processed by mid-stream eviction —
+    /// they have no residual that the drain needs to probe, so the HT
+    /// and BlockStore are dead weight that would otherwise sit live
+    /// throughout the drain (the drain frees them lazily inside its
+    /// loop, but the run peak is reached at the start of the drain).
+    ///
+    /// Without this pass, under tight budgets all `total_leaves` HTs
+    /// end up built during scatter (cumulative `evictUntilUnderBudget`
+    /// calls) and stay alive into the drain. With this pass, only
+    /// leaves with non-zero residual survive into the drain. Tight-
+    /// budget workloads often see this loop free nothing (every leaf
+    /// has some residual in some worker); the loop cost is O(threads
+    /// × total_leaves) reads with no atomics, sub-millisecond at
+    /// realistic scale.
+    for (size_t L = 0; L < total_leaves; ++L)
+    {
+        size_t residual_rows = 0;
+        for (const auto & s : worker_states)
+            residual_rows += s.leaf_rows[L];
+        if (residual_rows != 0)
+            continue;
+        /// Tracker-backed assignment so the cells buffer is actually
+        /// released. Assigning from a default-constructed JHT (which
+        /// uses `get_default_resource()`) would NOT free the buffer
+        /// because `polymorphic_allocator::POCMA = false` requires
+        /// equal allocators for move-assign to steal — and an unequal
+        /// allocator falls back to in-place clear, leaving the cells
+        /// allocation alive on the tracker.
+        leaf_hts[L] = JoinHashTable(&tracker);
+        leaf_stores[L].reset();
+    }
+
     /// -------- WORK-STEALING DRAIN (PHJ-EQUIVALENT) --------
     /// Mid-stream eviction has already processed (and dropped) the
     /// slices it was forced to flush; whatever remains lives in each
@@ -571,7 +606,16 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                     /// store are no longer needed; release them so the
                     /// drain doesn't keep up to `total_leaves` HTs
                     /// alive simultaneously.
-                    leaf_hts[L] = JoinHashTable{};
+                    /// IMPORTANT: assign from a tracker-backed JHT, not
+                    /// a default-constructed one. `polymorphic_allocator`
+                    /// has `POCMA = false` and the allocators must compare
+                    /// equal for the move-assignment to steal (and free)
+                    /// the existing cells buffer. A default JHT uses
+                    /// `get_default_resource()` which is unequal to our
+                    /// `&tracker`, so its move-assignment only clears
+                    /// `size` to 0 while leaving the (potentially 2 MiB)
+                    /// cells allocation alive on the tracker.
+                    leaf_hts[L] = JoinHashTable(&tracker);
                     leaf_stores[L].reset();
                     continue;
                 }
@@ -619,7 +663,9 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                 /// drain's accounting of `dropLeafProbeBuffers` calls.
                 const TimePoint td0 = now();
                 dropPartition(merged);
-                leaf_hts[L] = JoinHashTable{};
+                /// Tracker-backed assignment so the move-assign can steal
+                /// and free the cells buffer (see note above).
+                leaf_hts[L] = JoinHashTable(&tracker);
                 leaf_stores[L].reset();
                 my_eviction_ns += toNanos(now() - td0);
                 ++my_evictions;

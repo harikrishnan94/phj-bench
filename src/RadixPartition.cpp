@@ -55,7 +55,28 @@ template <typename T>
 }
 
 
-constexpr size_t TARGET_INITIAL_BUFFER_BYTES = 16 * 1024;
+/// Initial per-OutBlock buffer size. Tuned at 4 KiB rather than the
+/// historical 16 KiB to balance two regimes:
+///
+///   - BEP's per-(worker, leaf) probe scatter creates `threads ×
+///     total_leaves` chains (e.g. 48 × 2048 ≈ 98K) and each populated
+///     chain pre-allocates a full initial OutBlock. With 16 KiB the
+///     first-block capacity dominates probe-buffer memory (5 GiB
+///     observed for 768 MiB of logical rows on a 100M/100M run).
+///   - PHJ's radix shuffle pass-2 chains average ~1K rows per (worker,
+///     leaf). Too small an initial size forces extra doublings whose
+///     accumulated capacity (the doubling scheme keeps every block
+///     ever allocated, since they may all hold rows) exceeds the
+///     single-block capacity at 16 KiB.
+///
+/// At 4 KiB:
+///   - BEP probe data: ~640 MiB (vs 5104 MiB at 16 KiB).
+///   - PHJ pass-2 chains: 1 KiB rows fit in 1-2 blocks of total ~6 KiB
+///     capacity (vs 16 KiB single block at the old default). Small win.
+///   - Heavily-populated chains: 3 extra grow() calls to reach 64K rows;
+///     each grow is one `std::pmr::vector::assign`, sub-microsecond at
+///     these sizes. Aggregate impact <1% of wall time.
+constexpr size_t TARGET_INITIAL_BUFFER_BYTES = 4 * 1024;
 constexpr size_t MAX_OUT_BLOCK_ROWS = 65'536;
 
 
