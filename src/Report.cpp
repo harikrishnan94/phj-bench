@@ -45,6 +45,12 @@ std::string formatDouble(double x, int prec = 3)
 }
 
 
+double bytesToMib(size_t bytes)
+{
+    return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+
 struct Row
 {
     std::string phase;
@@ -58,7 +64,7 @@ struct BepFooter
     size_t bep_budget_mib = 0;
     Stats evictions;
     Stats refinements;
-    Stats peak_rows;
+    Stats peak_mib;
     Stats skip_retries;
     bool present = false;
 };
@@ -115,7 +121,7 @@ void printSchemeTable(
     {
         /// BEP per-run metrics footer. `bep_budget_mib` is the input
         /// CLI value (constant across reps); the four counters are
-        /// summarised med/min/max across reps (peak_rows is itself
+        /// summarised med/min/max across reps (peak_mib is itself
         /// already a max across workers per rep).
         auto writeMetric = [&](const std::string & name, const Stats & s, int prec)
         {
@@ -138,7 +144,7 @@ void printSchemeTable(
         os << "\n";
         writeMetric("bep_evictions", bep.evictions, 0);
         writeMetric("bep_refinements", bep.refinements, 0);
-        writeMetric("bep_peak_rows", bep.peak_rows, 0);
+        writeMetric("bep_peak_mib", bep.peak_mib, 3);
         writeMetric("bep_skip_retries", bep.skip_retries, 0);
         os << std::string(16 + COL_WIDTH * 6, '-') << "\n";
     }
@@ -233,7 +239,7 @@ std::vector<Row> bepRows(const std::vector<PhjBepResult> & reps, Stats & e2e_out
         e2e_ms.push_back(r.e2e_wall_ms);
         evicts.push_back(static_cast<double>(r.bep_evictions));
         refines.push_back(static_cast<double>(r.bep_refinements));
-        peaks.push_back(static_cast<double>(r.bep_peak_buffered_rows));
+        peaks.push_back(bytesToMib(r.bep_peak_bytes));
         skips.push_back(static_cast<double>(r.bep_build_skip_retries));
     }
     e2e_out = computeStats(e2e_ms);
@@ -241,7 +247,7 @@ std::vector<Row> bepRows(const std::vector<PhjBepResult> & reps, Stats & e2e_out
     footer.bep_budget_mib = reps.empty() ? 0 : reps.front().bep_budget_mib;
     footer.evictions = computeStats(evicts);
     footer.refinements = computeStats(refines);
-    footer.peak_rows = computeStats(peaks);
+    footer.peak_mib = computeStats(peaks);
     footer.skip_retries = computeStats(skips);
     return {
         {"build-shuffle", computeStats(bs_ms), computeStats(bs_ns)},
@@ -343,7 +349,7 @@ void writeCsv(
              "build_shuffle_wall_ms,build_shuffle_ns_per_row,probe_shuffle_wall_ms,probe_shuffle_ns_per_row,"
              "eviction_overhead_wall_ms,eviction_overhead_ns_per_row,"
              "e2e_wall_ms,"
-             "bep_budget_mib,bep_evictions,bep_refinements,bep_peak_buffered_rows,bep_build_skip_retries\n";
+             "bep_budget_mib,bep_evictions,bep_refinements,bep_peak_mib,bep_build_skip_retries\n";
     }
 
     const std::string bsch = schemaToString(opts.build_schema);
@@ -385,7 +391,7 @@ void writeCsv(
         emitBlank(); /* bep_budget_mib */
         emitBlank(); /* bep_evictions */
         emitBlank(); /* bep_refinements */
-        emitBlank(); /* bep_peak_buffered_rows */
+        emitBlank(); /* bep_peak_mib */
         emitTailBlank(); /* bep_build_skip_retries */
         f << '\n';
     }
@@ -407,7 +413,7 @@ void writeCsv(
         emitBlank(); /* bep_budget_mib */
         emitBlank(); /* bep_evictions */
         emitBlank(); /* bep_refinements */
-        emitBlank(); /* bep_peak_buffered_rows */
+        emitBlank(); /* bep_peak_mib */
         emitTailBlank(); /* bep_build_skip_retries */
         f << '\n';
     }
@@ -429,7 +435,7 @@ void writeCsv(
         emitInt(r.bep_budget_mib);
         emitInt(r.bep_evictions);
         emitInt(r.bep_refinements);
-        emitInt(r.bep_peak_buffered_rows);
+        emit(bytesToMib(r.bep_peak_bytes));
         emitTailInt(r.bep_build_skip_retries);
         f << '\n';
     }

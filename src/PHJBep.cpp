@@ -53,8 +53,8 @@ enum class LeafState : uint8_t
 ///                        of the same bucket already deposited.
 ///
 /// `unrefined_rows[p1]` and `leaf_rows[l]` mirror each chain's filled
-/// row count; the eviction argmax reads them directly and the trigger
-/// uses `total_rows * bytes_per_row` against the budget.
+/// row count; the eviction argmax reads them directly and byte metrics
+/// are derived from `total_rows * bytes_per_row`.
 struct WorkerProbeState
 {
     /// Pass-1 chains, indexed by pass-1 partition id `p1 \in [0, P)`.
@@ -67,12 +67,12 @@ struct WorkerProbeState
 
     /// Running totals (used for both the trigger check and argmax).
     size_t total_rows = 0;
-    size_t peak_rows = 0;
+    size_t peak_bytes = 0;
 
     /// Probe-row byte size: `sizeof(uint64_t)` for the key column plus
     /// `probe_schema.rowByteSize()`. Counts toward the per-worker
     /// memory budget M; refinement is row-preserving so we use a row
-    /// count rather than a byte count internally.
+    /// count internally and convert to bytes at accounting boundaries.
     size_t bytes_per_row = 0;
 };
 
@@ -86,9 +86,15 @@ struct EvictTarget
 };
 
 
+[[gnu::always_inline]] inline size_t bufferedBytes(const WorkerProbeState & s) noexcept
+{
+    return s.total_rows * s.bytes_per_row;
+}
+
+
 [[gnu::always_inline]] inline bool overBudget(const WorkerProbeState & s, size_t budget_bytes) noexcept
 {
-    return s.total_rows * s.bytes_per_row >= budget_bytes;
+    return bufferedBytes(s) >= budget_bytes;
 }
 
 
@@ -174,7 +180,7 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
     std::vector<uint64_t> ns_eviction(threads, 0);
     std::vector<size_t> worker_evictions(threads, 0);
     std::vector<size_t> worker_refinements(threads, 0);
-    std::vector<size_t> worker_peak_rows(threads, 0);
+    std::vector<size_t> worker_peak_bytes(threads, 0);
     std::vector<size_t> worker_skip_retries(threads, 0);
 
     /// Hoisted per-worker state. The work-stealing drain below runs in
@@ -304,7 +310,7 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                 dropPartition(s.leaf[leaf]);
             };
 
-            auto bumpPeak = [&]() noexcept { s.peak_rows = std::max(s.peak_rows, s.total_rows); };
+            auto bumpPeak = [&]() noexcept { s.peak_bytes = std::max(s.peak_bytes, bufferedBytes(s)); };
 
             /// Inner eviction loop: invoked at every input-block boundary
             /// (and once at end of input, via the drain phase below).
@@ -445,7 +451,7 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
             ns_eviction[tid] = my_eviction_ns;
             worker_evictions[tid] = my_evictions;
             worker_refinements[tid] = my_refinements;
-            worker_peak_rows[tid] = s.peak_rows;
+            worker_peak_bytes[tid] = s.peak_bytes;
             worker_skip_retries[tid] = my_skip_retries;
         });
 
@@ -665,13 +671,13 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
     result.bep_evictions = 0;
     result.bep_refinements = 0;
     result.bep_build_skip_retries = 0;
-    result.bep_peak_buffered_rows = 0;
+    result.bep_peak_bytes = 0;
     for (size_t t = 0; t < threads; ++t)
     {
         result.bep_evictions += worker_evictions[t];
         result.bep_refinements += worker_refinements[t];
         result.bep_build_skip_retries += worker_skip_retries[t];
-        result.bep_peak_buffered_rows = std::max(result.bep_peak_buffered_rows, worker_peak_rows[t]);
+        result.bep_peak_bytes = std::max(result.bep_peak_bytes, worker_peak_bytes[t]);
     }
 
     return result;

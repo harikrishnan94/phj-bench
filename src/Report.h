@@ -16,7 +16,7 @@ namespace phj
 /// Pretty-print one run's results (per scheme: median/min/max across reps
 /// for each phase metric). The BEP-backed PHJ table additionally contains an
 /// `eviction-overhead` phase row and a footer with the BEP per-run
-/// metrics (budget, evictions, refinements, peak buffered rows, build
+/// metrics (budget, evictions, refinements, peak buffered MiB, build
 /// skip retries).
 void printSummary(
     std::ostream & os,

@@ -188,8 +188,8 @@ and PHJ-PURE rows):
 - `bep_evictions` — total leaf evictions across all workers.
 - `bep_refinements` — total forced refinements across all workers
   (BEP's only refinement trigger is the budget check).
-- `bep_peak_buffered_rows` — max across workers and across the run of
-  total buffered probe rows.
+- `bep_peak_mib` — max across workers and across the run of total
+  buffered probe-side bytes, reported in MiB.
 - `bep_build_skip_retries` — total `BUILDING`-skip events across all
   workers.
 

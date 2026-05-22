@@ -28,7 +28,8 @@ struct PhjBepResult
     size_t bep_budget_mib = 0;
     size_t bep_evictions = 0;
     size_t bep_refinements = 0;
-    size_t bep_peak_buffered_rows = 0;
+    /// Maximum per-worker probe-side buffered bytes observed during the run.
+    size_t bep_peak_bytes = 0;
     size_t bep_build_skip_retries = 0;
 };
 

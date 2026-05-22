@@ -90,7 +90,8 @@ int main(int argc, char ** argv)
                       << " ms, shuffle(probe) " << res.probe_shuffle.wall_ms << " ms, probe " << res.probe.wall_ms << " ms, evict "
                       << res.eviction_overhead.wall_ms << " ms, e2e " << res.e2e_wall_ms << " ms, out_rows " << res.output.totalRows()
                       << ", budget " << res.bep_budget_mib << " MiB, evictions " << res.bep_evictions << ", refinements "
-                      << res.bep_refinements << ", peak " << res.bep_peak_buffered_rows << " rows, skip-retries "
+                      << res.bep_refinements << ", bep_peak_mib " << static_cast<double>(res.bep_peak_bytes) / (1024.0 * 1024.0)
+                      << " MiB, skip-retries "
                       << res.bep_build_skip_retries << "\n";
             bep_reps.push_back(std::move(res));
         }
