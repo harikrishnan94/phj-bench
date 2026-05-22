@@ -26,17 +26,32 @@ namespace phj
 namespace
 {
 
-/// Per-leaf HT lifecycle. Strictly monotonic transitions
-/// `NOT_BUILT -> BUILDING -> BUILT`, claimed via CAS by the first
-/// worker that selects the leaf for eviction. Acquire/release atomic
-/// ordering establishes happens-before from the constructor's writes
-/// to `leaf_hts[L]` / `leaf_stores[L]` (within `BUILDING`) to any
-/// subsequent reader that observes `BUILT`.
+/// Per-leaf HT lifecycle. Transitions form a small state machine
+/// claimed via CAS:
+///
+///   NOT_BUILT  --CAS-->  BUILDING  --store-->  STEALING
+///   BUILT      --CAS-->  STEALING  --store-->  BUILT
+///   (steal yielded 0 rows)         --store-->  BUILT
+///
+/// `BUILDING` and `STEALING` are exclusive-ownership claims that
+/// gate the per-leaf work (HT construction and chain steal+probe+
+/// drop, respectively). `argmaxGlobalLeaf` filters out both states
+/// so that 48 workers don't converge on the same leaf — eliminates
+/// the per-leaf mutex contention previously caused by all workers
+/// racing to steal the same `BUILT` leaf simultaneously. Without
+/// this, ~85-91% of `stealLeafChain` calls returned zero rows after
+/// waiting on the mutex, because the first stealer drained the
+/// chain and the rest woke up to an empty leaf.
+///
+/// Acquire/release ordering establishes happens-before from the
+/// constructor's writes inside `BUILDING` to any subsequent reader
+/// that observes `BUILT` or `STEALING`.
 enum class LeafState : uint8_t
 {
     NOT_BUILT = 0,
     BUILDING = 1,
     BUILT = 2,
+    STEALING = 3,
 };
 
 
@@ -448,8 +463,10 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
             };
 
             /// Pick the globally largest published leaf chain that
-            /// is NOT currently in BUILDING state. Returns SIZE_MAX
-            /// if no eligible leaf exists.
+            /// is in `NOT_BUILT` or `BUILT` state (i.e., not already
+            /// claimed by another worker as `BUILDING` or
+            /// `STEALING`). Returns SIZE_MAX if no eligible leaf
+            /// exists.
             auto argmaxGlobalLeaf = [&]() noexcept -> size_t
             {
                 size_t best_l = SIZE_MAX;
@@ -459,7 +476,8 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                     const size_t r = published_leaf_rows[l].load(std::memory_order_relaxed);
                     if (r == 0)
                         continue;
-                    if (leaf_states[l].load(std::memory_order_acquire) == LeafState::BUILDING)
+                    const LeafState ls = leaf_states[l].load(std::memory_order_acquire);
+                    if (ls == LeafState::BUILDING || ls == LeafState::STEALING)
                         continue;
                     if (r > best_rows)
                     {
@@ -606,19 +624,26 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                 if (leaf == SIZE_MAX)
                     return false;
 
-                /// CAS-claim BUILD if NOT_BUILT. Workers concurrently
-                /// running this loop converge on the same `leaf`
-                /// from argmax, so the CAS is the natural single-
-                /// claimer point: the winner builds + probes, the
-                /// losers fall through to the next argmax (which
-                /// excludes BUILDING leaves) and pick a different
-                /// target. This is what gives the cooperative leaf
-                /// drain its parallelism.
+                /// Claim the leaf for the ENTIRE evict operation
+                /// (build-if-needed + steal + probe + drop) via the
+                /// `LeafState` machine. `argmaxGlobalLeaf` already
+                /// filtered out leaves in `BUILDING` / `STEALING`,
+                /// but a concurrent worker may have transitioned
+                /// the leaf between our argmax and our CAS — that's
+                /// the natural retry point.
+                ///
+                /// CRITICAL: this is what eliminates the cross-
+                /// worker mutex contention on the per-leaf chain.
+                /// Without the `STEALING` claim 48 workers
+                /// converged on the same `BUILT` leaf, contended
+                /// on `leaf_mutexes[L]`, and 47 of them stole an
+                /// empty chain (~85-91% waste rate, ~3.2 s/thread
+                /// in the 1 GiB regime).
                 const TimePoint ts0 = now();
                 LeafState st = leaf_states[leaf].load(std::memory_order_acquire);
                 my_eviction_ns += toNanos(now() - ts0);
 
-                if (st == LeafState::BUILDING)
+                if (st == LeafState::BUILDING || st == LeafState::STEALING)
                 {
                     ++my_skip_retries;
                     return false;
@@ -637,22 +662,58 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                     }
                     const TimePoint tb0 = now();
                     buildLeafHt(leaf);
-                    leaf_states[leaf].store(LeafState::BUILT, std::memory_order_release);
+                    /// Build complete. Transition straight to
+                    /// `STEALING` rather than `BUILT` — we're about
+                    /// to consume the leaf ourselves, so there's no
+                    /// `BUILT`-window for another worker to race
+                    /// against.
+                    leaf_states[leaf].store(LeafState::STEALING, std::memory_order_release);
                     my_build_ns += toNanos(now() - tb0);
                 }
+                else
+                {
+                    /// `st == BUILT`. CAS-claim `BUILT -> STEALING`
+                    /// so we hold the leaf exclusively for the
+                    /// steal+probe+drop. A failed CAS means another
+                    /// worker beat us to the claim; retry from the
+                    /// next argmax.
+                    const TimePoint tc0 = now();
+                    LeafState expected = LeafState::BUILT;
+                    const bool claimed
+                        = leaf_states[leaf].compare_exchange_strong(expected, LeafState::STEALING, std::memory_order_acq_rel);
+                    my_eviction_ns += toNanos(now() - tc0);
+                    if (!claimed)
+                    {
+                        ++my_skip_retries;
+                        return false;
+                    }
+                }
 
-                /// HT is BUILT. Cross-worker steal under per-leaf
-                /// mutex: this is the (A) win — every worker's
-                /// contribution to leaf L is processed in a
-                /// single continuous probe sweep with hot HT
-                /// and hot build-side store on this thread.
+                /// We hold the `STEALING` claim on `leaf`. No other
+                /// worker can be in `stealLeafChain(leaf, ...)`
+                /// concurrently; publishers (refining workers) can
+                /// still publish into `published_leaves[L]` under
+                /// the per-leaf mutex, but the stealer is unique.
                 PartitionOut stolen(&tracker);
                 const TimePoint tst0 = now();
                 const size_t stolen_rows = stealLeafChain(leaf, stolen);
                 my_eviction_ns += toNanos(now() - tst0);
 
                 if (stolen_rows == 0)
+                {
+                    /// Nothing to steal (the published rows we
+                    /// observed pre-CAS were drained between the
+                    /// argmax and the steal — possible if a
+                    /// publisher cleared its `intermediate[i]`
+                    /// after our argmax read `published_leaf_rows`
+                    /// but before the publish actually committed
+                    /// blocks; see the relaxed-counter ordering in
+                    /// `refinePartition`). Release the claim back
+                    /// to `BUILT` so future argmax can pick it up
+                    /// once new rows accrue.
+                    leaf_states[leaf].store(LeafState::BUILT, std::memory_order_release);
                     return false;
+                }
 
                 const TimePoint tp0 = now();
                 const JoinHashTable & ht = leaf_hts[leaf];
@@ -662,6 +723,9 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
 
                 const TimePoint td0 = now();
                 dropPartition(stolen);
+                /// Release the `STEALING` claim. `BUILT` is the
+                /// canonical "idle, HT present" state.
+                leaf_states[leaf].store(LeafState::BUILT, std::memory_order_release);
                 my_eviction_ns += toNanos(now() - td0);
                 ++my_evictions;
                 return true;
