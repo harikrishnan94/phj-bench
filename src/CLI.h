@@ -38,7 +38,7 @@ struct Options
     /// Per-worker probe-side memory budget for the BEP-backed PHJ, in mebibytes.
     /// Only probe input buffer bytes (across unrefined and leaf chains)
     /// count toward this budget; checked at input-block boundaries.
-    size_t bep_budget_mib = 32;
+    size_t bep_budget_mib = 512;
 };
 
 

@@ -33,8 +33,9 @@ Options:
   --partition-bits-per-pass LIST Comma-separated bits-per-pass list (overrides
                                  --partitions and --passes). Example: 6,4 ->
                                  1024 partitions in two passes.
-  --bep-budget-mib N             PHJ per-worker probe buffer budget in MiB
-                                 (default: 32). Only probe input buffer bytes
+  --bep-budget-mib N             PHJ global probe buffer budget in MiB
+                                 (default: 512), shared across all worker
+                                 threads. Only probe input buffer bytes
                                  (unrefined and leaf chains) count toward it.
   --reps N                       Repetitions per scheme (default: 1).
   --csv PATH                     Write per-rep CSV to this path (optional).

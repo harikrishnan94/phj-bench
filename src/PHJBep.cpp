@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <memory_resource>
+#include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -39,51 +40,40 @@ enum class LeafState : uint8_t
 };
 
 
-/// Per-worker probe-side buffer state. The worker holds two parallel
-/// arrays of `PartitionOut` chains drawn from the radix scatter
-/// machinery:
+/// Per-worker buffer state. After the F-style refactor each worker
+/// keeps only its own pass-1 (`unrefined`) chains; refined leaf rows
+/// are published into the SHARED `published_leaves[L]` chains under
+/// per-leaf mutexes. Refinement first scatters the consumed
+/// `unrefined[p1]` into a worker-local `intermediate` array (so
+/// `scatterBatch`'s interleaved per-partition writes happen entirely
+/// off-shared-memory) and then briefly locks each destination leaf
+/// to move blocks into the shared chain.
 ///
-///   - `unrefined[p1]`  — pass-1 buckets; receives every scatter_pass1
-///                        output for pass-1 partition id `p1`. A pass-1
-///                        bucket can accumulate rows again after being
-///                        previously refined, since pass 1 is the only
-///                        scatter applied to incoming probe blocks.
-///   - `leaf[l]`        — leaf buckets; populated only by refinement.
-///                        Refining `p1` appends its currently-buffered
-///                        rows into `leaf[p1 * leaves_per_p1 .. ...)`,
-///                        coexisting with whatever earlier refinements
-///                        of the same bucket already deposited.
-///
-/// `unrefined_rows[p1]` and `leaf_rows[l]` mirror each chain's filled
-/// row count; the eviction argmax reads them directly (a chain with
-/// more filled rows is the larger candidate to evict). Byte metrics
-/// driving the budget trigger and per-worker peak are computed from
-/// the chains' OutBlock CAPACITIES, not filled rows: under tight
-/// budgets a chain may hold over-capacity OutBlocks (the radix
-/// scatter's doubling-grow scheme can allocate up to ~1 MiB per
-/// block once `next_cap` has saturated). Using filled rows as the
-/// budget metric under-counts actual memory by up to the doubling
-/// factor and leads to runaway capacity waste; using capacity makes
-/// the budget bound real memory.
-///
-/// All internal vectors use the supplied memory resource so that
-/// buffer allocations are tracked by the run's MemTracker.
+/// The worker caches its own `unrefined` capacity-bytes counter
+/// (`unrefined_cap_bytes`) so the per-block budget check doesn't have
+/// to re-walk all pass-1 chains. A separate shared
+/// `global_unrefined_cap_bytes` atomic mirrors the sum across workers
+/// for the global peak-tracking path; the worker updates it with the
+/// delta whenever its own count changes (`refreshUnrefinedCapBytes`).
 struct WorkerProbeState
 {
     std::pmr::vector<PartitionOut> unrefined;
     std::pmr::vector<size_t> unrefined_rows;
-    std::pmr::vector<PartitionOut> leaf;
-    std::pmr::vector<size_t> leaf_rows;
 
-    size_t total_rows = 0;
-    size_t peak_bytes = 0;
+    /// Reusable intermediate destination for refinement. Sized to
+    /// `leaves_per_p1`. Cleared and re-initialised at the start of
+    /// each `refinePartition` invocation so its blocks vector is
+    /// empty (the previous refinement's blocks were moved into the
+    /// shared chain).
+    std::pmr::vector<PartitionOut> intermediate;
+
+    size_t unrefined_cap_bytes = 0;
     size_t bytes_per_row = 0;
 
     explicit WorkerProbeState(std::pmr::memory_resource * mr)
         : unrefined(mr)
         , unrefined_rows(mr)
-        , leaf(mr)
-        , leaf_rows(mr)
+        , intermediate(mr)
     {
     }
 };
@@ -91,7 +81,7 @@ struct WorkerProbeState
 
 struct EvictTarget
 {
-    /// 0 = unrefined pass-1 partition, 1 = leaf.
+    /// 0 = unrefined pass-1 partition (per-worker), 1 = published leaf (shared).
     int kind = 0;
     size_t idx = 0;
     size_t rows = 0;
@@ -130,65 +120,41 @@ void compactOutBlock(OutBlock & blk)
 }
 
 
-/// Total allocated capacity (in rows) across both unrefined and leaf
-/// chains. Touches every non-empty chain's OutBlocks and reads each
-/// block's `capacity` field. The chains' `blocks` vectors are
-/// per-worker (no contention) and the scan is bounded by the number
-/// of currently-non-empty chains × ~1–3 OutBlocks each — typically
-/// well under 10K reads, all cache-hot per-worker memory.
-[[gnu::always_inline]] inline size_t allocatedCapRows(const WorkerProbeState & s) noexcept
+[[gnu::always_inline]] inline size_t unrefinedCapBytesFromScan(const WorkerProbeState & s) noexcept
 {
-    size_t cap = 0;
+    size_t cap_rows = 0;
     for (const auto & po : s.unrefined)
         for (const auto & blk : po.blocks)
-            cap += blk.capacity;
-    for (const auto & po : s.leaf)
-        for (const auto & blk : po.blocks)
-            cap += blk.capacity;
-    return cap;
+            cap_rows += blk.capacity;
+    return cap_rows * s.bytes_per_row;
 }
 
 
-[[gnu::always_inline]] inline size_t allocatedBytes(const WorkerProbeState & s) noexcept
+/// Probe a contiguous sequence of OutBlocks against `ht` / `store`.
+/// Used both by mid-stream eviction (after stealing a leaf's chain
+/// out of the shared structure) and by the end-of-input drain. The
+/// per-block `probeOneBlock` is called per OutBlock; scratch vectors
+/// are reused across iterations so any growth amortises across the
+/// entire chain. This is the (C) wrapper: chain-level entry point
+/// that keeps the call boundary stable while leaving per-block hash
+/// / find / gather as the unit of vectorisation.
+template <class HT>
+[[gnu::always_inline]] inline void probeChain(
+    const std::pmr::vector<OutBlock> & blocks,
+    const BlockStore & store,
+    const HT & ht,
+    ProbeMaterialiser & mat,
+    std::pmr::vector<uint64_t> & hashes,
+    std::pmr::vector<RowRefCell> & heads,
+    std::pmr::vector<size_t> & probe_idx,
+    std::pmr::vector<RowRefCell> & build_ref)
 {
-    return allocatedCapRows(s) * s.bytes_per_row;
-}
-
-
-[[gnu::always_inline]] inline bool overBudget(const WorkerProbeState & s, size_t budget_bytes) noexcept
-{
-    return allocatedBytes(s) >= budget_bytes;
-}
-
-
-/// Pick the largest buffered partition across both structural states.
-/// Leaves currently in `BUILDING` are skipped; their state is loaded
-/// with acquire ordering so a subsequent successful probe load of
-/// `BUILT` will see the constructor's HT / store writes.
-EvictTarget argmaxBuffered(const WorkerProbeState & s, const std::vector<std::atomic<LeafState>> & leaf_states) noexcept
-{
-    EvictTarget best{};
-    const size_t P = s.unrefined.size();
-    for (size_t p1 = 0; p1 < P; ++p1)
+    for (const auto & blk : blocks)
     {
-        const size_t r = s.unrefined_rows[p1];
-        if (r == 0)
+        if (blk.rows == 0)
             continue;
-        if (r > best.rows)
-            best = {0, p1, r};
+        probeOneBlock(blk.view(), store, ht, mat, hashes, heads, probe_idx, build_ref);
     }
-    const size_t L = s.leaf.size();
-    for (size_t l = 0; l < L; ++l)
-    {
-        const size_t r = s.leaf_rows[l];
-        if (r == 0)
-            continue;
-        if (leaf_states[l].load(std::memory_order_acquire) == LeafState::BUILDING)
-            continue;
-        if (r > best.rows)
-            best = {1, l, r};
-    }
-    return best;
 }
 
 }
@@ -218,14 +184,6 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
     /// the previous block's capacity (capped at `MAX_OUT_BLOCK_ROWS`),
     /// so the last block per (thread, partition) chain typically
     /// holds significantly fewer rows than its allocated capacity.
-    /// Without this pass that trailing slack rides through into the
-    /// per-leaf `BlockStore`s (one move per outBlockToBlock(), no
-    /// shrink) and contributes ~1.4 GiB to peak memory on a 100M
-    /// build with 2048 partitions × 16 threads. Done in parallel
-    /// per chain; each `compactOutBlock` is a single allocator-
-    /// preserving copy over the block's filled rows, so the
-    /// transient peak overshoot is bounded by one block's filled
-    /// rows per thread (~MiBs, not GiBs).
     parallelRun(
         threads,
         [&](size_t tid)
@@ -244,9 +202,56 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
     const size_t leaves_per_p1 = total_leaves / P;
     const uint32_t pass1_shift = static_cast<uint32_t>(64u - pass1_bits);
     const size_t bytes_per_row = sizeof(uint64_t) + probe.schema.rowByteSize();
-    const size_t budget_bytes = bep_budget_mib * size_t{1024} * size_t{1024};
 
-    /// -------- SHARED PER-LEAF STATE (HT lifecycle) --------
+    /// `bep_budget_mib` is the GLOBAL probe buffer budget, shared
+    /// across all worker threads. The worker-level triggers below
+    /// derive thresholds from `per_worker_view_budget = budget /
+    /// threads`, so the sum of per-worker views (own unrefined +
+    /// fair share of global published leaves) stays bounded by
+    /// `budget_bytes` modulo a one-batch overshoot. The reported
+    /// `bep_peak_mib` is the global probe-buffer peak across the
+    /// whole run, directly comparable to `bep_budget_mib`.
+    const size_t budget_bytes = bep_budget_mib * size_t{1024} * size_t{1024};
+    const size_t per_worker_view_budget = budget_bytes / threads;
+
+    /// Split the per-worker view budget into TWO independent triggers
+    /// (option E hysteresis on each):
+    ///
+    ///   - unrefined: own per-worker pass-1 buffers. Worker T
+    ///     refines its own biggest pass-1 chain when its own
+    ///     `unrefined_cap_bytes` crosses the high-water threshold,
+    ///     until it dips back below the low-water threshold. No
+    ///     coordination required — each worker manages its own
+    ///     pass-1 budget.
+    ///
+    ///   - leaf share: global published-leaf capacity scaled to
+    ///     per-worker share. When the per-worker share crosses
+    ///     the leaf high-water threshold, EVERY worker enters
+    ///     the cooperative drain loop (their local view of
+    ///     global state is identical, modulo memory ordering).
+    ///     They each independently pick the global argmax leaf
+    ///     and drain it; the per-leaf CAS-claim and chain mutex
+    ///     ensure workers settle on distinct leaves naturally.
+    ///
+    /// Splitting the trigger is the core fix for the work imbalance
+    /// that a coupled trigger creates: with a unified
+    /// `own_unrefined + leaf_share >= per_worker_view_budget` trigger,
+    /// the worker with the larger own_unrefined triggers first and
+    /// absorbs the (cross-worker, by design) leaf drain on its own
+    /// while other workers continue scattering — turning option A's
+    /// cross-worker coalescing into a serialisation bottleneck rather
+    /// than a parallelisation win. With separate triggers the leaf
+    /// drain is symmetric across workers and (A) actually runs in
+    /// parallel.
+    ///
+    /// Split is 1/4 unrefined, 3/4 leaves of the per-worker view
+    /// budget.
+    const size_t unrefined_high_water_per_worker = per_worker_view_budget / 4;
+    const size_t unrefined_low_water_per_worker = unrefined_high_water_per_worker / 2;
+    const size_t leaf_share_high_water_per_worker = (per_worker_view_budget * 3) / 4;
+    const size_t leaf_share_low_water_per_worker = (leaf_share_high_water_per_worker * 5) / 8;
+
+    /// -------- SHARED PER-LEAF STATE --------
     std::vector<std::atomic<LeafState>> leaf_states(total_leaves);
     for (size_t l = 0; l < total_leaves; ++l)
         leaf_states[l].store(LeafState::NOT_BUILT, std::memory_order_relaxed);
@@ -254,14 +259,65 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
     /// `JoinHashTable` is move-constructible / default-constructible; we
     /// pre-allocate `total_leaves` empty tables using the tracker so that
     /// the CAS-claimed constructor's cell allocations are tracked.
-    /// `BlockStore` is neither movable nor copyable (carries a mutex), so
-    /// we hold each store via `unique_ptr`; each store is constructed with
-    /// the tracker so its internal data allocations are tracked.
     std::pmr::vector<JoinHashTable> leaf_hts(&tracker);
     leaf_hts.resize(total_leaves);
     std::vector<std::unique_ptr<BlockStore>> leaf_stores(total_leaves);
     for (auto & p : leaf_stores)
         p = std::make_unique<BlockStore>(&tracker);
+
+    /// Shared per-leaf probe-side chains. Every worker's refinement
+    /// publishes into `published_leaves[L]` under `leaf_mutexes[L]`;
+    /// eviction steals out of the same structure under the same
+    /// mutex. The shared chain is grown ONLY by `push_back` of
+    /// already-allocated OutBlocks (no `grow()` calls) — so the
+    /// chain's `cur` pointer and `next_cap` stay at their default
+    /// initial values and the chain doesn't auto-double its capacity.
+    /// That also subsumes (D): there's no per-eviction `next_cap`
+    /// reset to do because the doubling progression lives in the
+    /// per-worker `intermediate[i]` chain (which is short-lived
+    /// per-refinement) rather than the leaf chain itself.
+    std::pmr::vector<PartitionOut> published_leaves(&tracker);
+    published_leaves.resize(total_leaves);
+    for (auto & po : published_leaves)
+        initPartitionOut(po, probe.schema);
+
+    std::vector<std::mutex> leaf_mutexes(total_leaves);
+
+    /// Per-leaf row / capacity counters. Maintained alongside the
+    /// chains (under the same mutex) so they're consistent with
+    /// `published_leaves[L].blocks` at every observable point.
+    /// Argmax reads these atomically and uses them as hints; the
+    /// per-leaf mutex makes the "rows match blocks" invariant true.
+    std::vector<std::atomic<size_t>> published_leaf_rows(total_leaves);
+    std::vector<std::atomic<size_t>> published_leaf_caps(total_leaves);
+    for (size_t l = 0; l < total_leaves; ++l)
+    {
+        published_leaf_rows[l].store(0, std::memory_order_relaxed);
+        published_leaf_caps[l].store(0, std::memory_order_relaxed);
+    }
+
+    /// Aggregate capacity-row sum across all published leaves. Updated
+    /// lock-free outside the per-leaf mutex (it is a sum and we don't
+    /// need it to be sub-microsecond consistent with any single
+    /// leaf's chain — it's a budget hint). Read once per worker per
+    /// budget check to compute "share of global leaf capacity".
+    std::atomic<size_t> global_leaf_cap_rows{0};
+
+    /// Aggregate per-worker unrefined-capacity bytes summed across
+    /// every worker. Maintained via signed deltas: each worker, when
+    /// it refreshes its own `unrefined_cap_bytes`, adds the change to
+    /// this global. Used only for global peak tracking (see
+    /// `global_peak_probe_bytes` below) — the worker-local trigger
+    /// still consults `s.unrefined_cap_bytes` directly.
+    std::atomic<size_t> global_unrefined_cap_bytes{0};
+
+    /// Running maximum of the GLOBAL probe-buffer footprint observed
+    /// during the scatter+evict phase: `global_unrefined_cap_bytes +
+    /// global_leaf_cap_rows * bytes_per_row`. Updated lock-free with
+    /// a CAS loop on every per-block peak bump. This is the metric
+    /// reported as `bep_peak_mib`; with `bep_budget_mib` now global,
+    /// the peak is directly comparable to the budget.
+    std::atomic<size_t> global_peak_probe_bytes{0};
 
     /// -------- PER-WORKER TIMING + COUNTERS --------
     std::vector<uint64_t> ns_build(threads, 0);
@@ -270,14 +326,8 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
     std::vector<uint64_t> ns_eviction(threads, 0);
     std::vector<size_t> worker_evictions(threads, 0);
     std::vector<size_t> worker_refinements(threads, 0);
-    std::vector<size_t> worker_peak_bytes(threads, 0);
     std::vector<size_t> worker_skip_retries(threads, 0);
 
-    /// Hoisted per-worker state. The work-stealing drain below runs in
-    /// a second `parallelRun`, so the worker buffers and the per-thread
-    /// materialiser must outlive the scatter lambda: the drain reads
-    /// every worker's `s.leaf[L]` chains (to merge them per leaf) and
-    /// keeps appending output rows through the same materialiser.
     std::vector<WorkerProbeState> worker_states;
     worker_states.reserve(threads);
     for (size_t i = 0; i < threads; ++i)
@@ -290,6 +340,18 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
     /// owner-per-partition build+probe semantics for the drain.
     std::atomic<size_t> next_drain_leaf{0};
 
+    /// Worker liveness counter for cooperative end-of-slice draining.
+    /// Each worker decrements this when its input slice is exhausted;
+    /// before exiting the scatter parallelRun the worker spins on
+    /// global leaf draining as long as ANY worker is still scattering.
+    /// Without this, fast workers (those whose input happened to land
+    /// in cheap-to-refine partitions, or who were never the eviction
+    /// trigger) would idle at the parallelRun barrier while slow
+    /// workers carry the remaining eviction work alone — which is the
+    /// dominant residual source of probe-phase imbalance once split
+    /// triggers have parallelised the in-slice drain.
+    std::atomic<size_t> scatter_workers_active{threads};
+
     /// -------- PER-THREAD PROBE LOOP --------
     parallelRun(
         threads,
@@ -298,12 +360,11 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
             WorkerProbeState & s = worker_states[tid];
             s.unrefined.resize(P);
             s.unrefined_rows.resize(P, 0);
-            s.leaf.resize(total_leaves);
-            s.leaf_rows.resize(total_leaves, 0);
+            s.intermediate.resize(leaves_per_p1);
             s.bytes_per_row = bytes_per_row;
             for (auto & po : s.unrefined)
                 initPartitionOut(po, probe.schema);
-            for (auto & po : s.leaf)
+            for (auto & po : s.intermediate)
                 initPartitionOut(po, probe.schema);
 
             ScatterScratch scatter_scratch(&tracker);
@@ -324,48 +385,164 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
             size_t my_refinements = 0;
             size_t my_skip_retries = 0;
 
-            /// Worker's slice of probe input blocks.
             const size_t n_probe_blocks = probe.blocks.size();
             const size_t probe_start = (n_probe_blocks * tid) / threads;
             const size_t probe_end = (n_probe_blocks * (tid + 1)) / threads;
 
-            /// Force-refine an unrefined pass-1 partition through passes
-            /// 2..N onto leaves under its leaf range. Refinement is
-            /// row-preserving across the rows it consumed from
-            /// `unrefined[p1]`. The leaf chains may already hold rows
-            /// from a previous refinement of the same `p1`; the new
-            /// rows are appended onto them. Total per-worker rows are
-            /// unchanged.
-            auto refinePartition = [&](size_t p1)
+            /// Per-worker view of buffered bytes: own unrefined-chain
+            /// capacity plus a fair share of the globally published
+            /// leaf-chain capacity. Used for the worker-local
+            /// triggers (compared against thresholds derived from
+            /// `per_worker_view_budget = bep_budget_mib / threads`).
+            auto leafShareBytes
+                = [&]() noexcept -> size_t { return (global_leaf_cap_rows.load(std::memory_order_relaxed) * bytes_per_row) / threads; };
+
+            /// Refresh `s.unrefined_cap_bytes` from the worker's
+            /// chains and mirror the delta into
+            /// `global_unrefined_cap_bytes`. Called after every event
+            /// that changes the worker's own unrefined buffers
+            /// (scatter into pass-1, refinement that drains a
+            /// pass-1 chain). Cheap: 64 chains × ~1-3 blocks each.
+            auto refreshUnrefinedCapBytes = [&]() noexcept
             {
-                const size_t base = p1 * leaves_per_p1;
-                /// Snapshot the per-leaf row counts before refinement
-                /// so we can compute the per-leaf delta cheaply (rather
-                /// than scanning every leaf's chain from scratch).
-                std::vector<size_t> before(leaves_per_p1);
-                for (size_t i = 0; i < leaves_per_p1; ++i)
-                    before[i] = partitionRows(s.leaf[base + i]);
-
-                refineToLeaves(std::move(s.unrefined[p1]), probe.schema, cfg.pass_bits, s.leaf.data() + base, scatter_scratch, &tracker);
-
-                for (size_t i = 0; i < leaves_per_p1; ++i)
-                {
-                    const size_t after = partitionRows(s.leaf[base + i]);
-                    s.leaf_rows[base + i] += (after - before[i]);
-                }
-                /// `s.unrefined[p1]` is now moved-from (an empty chain
-                /// with possibly a dangling `cur`). Re-initialise so
-                /// future pass-1 scatters of incoming probe blocks
-                /// land into a valid chain — the same bucket can be
-                /// re-refined later when it accumulates again.
-                initPartitionOut(s.unrefined[p1], probe.schema);
-                s.unrefined_rows[p1] = 0;
+                const size_t new_val = unrefinedCapBytesFromScan(s);
+                if (new_val >= s.unrefined_cap_bytes)
+                    global_unrefined_cap_bytes.fetch_add(new_val - s.unrefined_cap_bytes, std::memory_order_relaxed);
+                else
+                    global_unrefined_cap_bytes.fetch_sub(s.unrefined_cap_bytes - new_val, std::memory_order_relaxed);
+                s.unrefined_cap_bytes = new_val;
             };
 
-            /// CAS-claim leaf L and (if claimed) construct its HT from
-            /// `build_part.chains[L]`. After construction, transition to
-            /// `BUILT` with release ordering so subsequent acquire
-            /// readers see the HT / store writes.
+            /// CAS-loop update of the GLOBAL probe-buffer peak. Every
+            /// worker calls this once per input block after refreshing
+            /// its own unrefined-cap bookkeeping; the load of
+            /// `global_unrefined_cap_bytes` therefore includes this
+            /// worker's latest contribution and a recent (possibly
+            /// slightly stale) view of every other worker's.
+            auto bumpGlobalPeak = [&]() noexcept
+            {
+                const size_t cur = global_unrefined_cap_bytes.load(std::memory_order_relaxed)
+                    + global_leaf_cap_rows.load(std::memory_order_relaxed) * bytes_per_row;
+                size_t old_peak = global_peak_probe_bytes.load(std::memory_order_relaxed);
+                while (cur > old_peak && !global_peak_probe_bytes.compare_exchange_weak(old_peak, cur, std::memory_order_relaxed))
+                {
+                }
+            };
+
+            /// Pick this worker's largest own pass-1 (unrefined)
+            /// chain. Returns SIZE_MAX if unrefined is empty.
+            auto argmaxOwnUnrefined = [&]() noexcept -> size_t
+            {
+                size_t best_p1 = SIZE_MAX;
+                size_t best_rows = 0;
+                for (size_t p1 = 0; p1 < P; ++p1)
+                {
+                    const size_t r = s.unrefined_rows[p1];
+                    if (r > best_rows)
+                    {
+                        best_rows = r;
+                        best_p1 = p1;
+                    }
+                }
+                return best_p1;
+            };
+
+            /// Pick the globally largest published leaf chain that
+            /// is NOT currently in BUILDING state. Returns SIZE_MAX
+            /// if no eligible leaf exists.
+            auto argmaxGlobalLeaf = [&]() noexcept -> size_t
+            {
+                size_t best_l = SIZE_MAX;
+                size_t best_rows = 0;
+                for (size_t l = 0; l < total_leaves; ++l)
+                {
+                    const size_t r = published_leaf_rows[l].load(std::memory_order_relaxed);
+                    if (r == 0)
+                        continue;
+                    if (leaf_states[l].load(std::memory_order_acquire) == LeafState::BUILDING)
+                        continue;
+                    if (r > best_rows)
+                    {
+                        best_rows = r;
+                        best_l = l;
+                    }
+                }
+                return best_l;
+            };
+
+            /// Force-refine an unrefined pass-1 partition through
+            /// passes 2..N onto its leaf range. The intermediate
+            /// destination is the worker's reusable `s.intermediate`
+            /// array; once `refineToLeaves` returns, each non-empty
+            /// `intermediate[i]` is move-published into the shared
+            /// `published_leaves[base + i]` chain under the per-leaf
+            /// mutex.
+            auto refinePartition = [&](size_t p1)
+            {
+                /// Re-initialise the intermediate slots so their
+                /// blocks vectors are empty (previous publication
+                /// already moved out the blocks; we still reset
+                /// `cur` and `next_cap` to canonical initial
+                /// values).
+                for (auto & po : s.intermediate)
+                    initPartitionOut(po, probe.schema);
+
+                refineToLeaves(std::move(s.unrefined[p1]), probe.schema, cfg.pass_bits, s.intermediate.data(), scatter_scratch, &tracker);
+
+                /// `s.unrefined[p1]` is now in moved-from state with
+                /// an empty blocks vector. Re-init it and refresh the
+                /// global unrefined counter BEFORE publishing the
+                /// refined intermediate into shared leaves. Without
+                /// this ordering, `global_unrefined_cap_bytes` would
+                /// still include `p1`'s capacity while
+                /// `global_leaf_cap_rows` has already absorbed it —
+                /// momentarily double-counting `p1` in any concurrent
+                /// global-peak CAS by another worker.
+                initPartitionOut(s.unrefined[p1], probe.schema);
+                s.unrefined_rows[p1] = 0;
+                refreshUnrefinedCapBytes();
+
+                const size_t base = p1 * leaves_per_p1;
+                size_t global_added_caps = 0;
+                for (size_t i = 0; i < leaves_per_p1; ++i)
+                {
+                    PartitionOut & src = s.intermediate[i];
+                    if (src.blocks.empty())
+                        continue;
+
+                    size_t added_rows = 0;
+                    size_t added_caps = 0;
+                    for (const auto & blk : src.blocks)
+                    {
+                        added_rows += blk.rows;
+                        added_caps += blk.capacity;
+                    }
+                    if (added_rows == 0)
+                        continue;
+
+                    const size_t L = base + i;
+                    {
+                        std::lock_guard<std::mutex> lock(leaf_mutexes[L]);
+                        for (auto & blk : src.blocks)
+                        {
+                            if (blk.rows > 0)
+                                published_leaves[L].blocks.push_back(std::move(blk));
+                        }
+                        published_leaf_rows[L].fetch_add(added_rows, std::memory_order_relaxed);
+                        published_leaf_caps[L].fetch_add(added_caps, std::memory_order_relaxed);
+                    }
+                    src.blocks.clear();
+                    src.cur = nullptr;
+                    global_added_caps += added_caps;
+                }
+                if (global_added_caps != 0)
+                    global_leaf_cap_rows.fetch_add(global_added_caps, std::memory_order_relaxed);
+            };
+
+            /// CAS-claim leaf L and (if claimed) construct its HT
+            /// from `build_part.chains[L]`. The transition to
+            /// `BUILT` uses release ordering so subsequent acquire
+            /// loads see the constructor's writes.
             auto buildLeafHt = [&](size_t leaf)
             {
                 BlockStore & store = *leaf_stores[leaf];
@@ -381,123 +558,159 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                 build_part.chains[leaf].blocks.clear();
             };
 
-            /// Probe-side processing: scan the worker's local leaf chain
-            /// against the shared `leaf_hts[leaf]` / `leaf_stores[leaf]`.
-            auto processPartition = [&](size_t leaf)
+            /// Steal the shared leaf chain's blocks into a worker-local
+            /// PartitionOut (so the lock is released as soon as the
+            /// vector moves are done, before the probe sweep starts).
+            /// Returns the number of rows stolen (0 if another worker
+            /// raced in and drained first).
+            auto stealLeafChain = [&](size_t leaf, PartitionOut & dst) noexcept -> size_t
             {
-                if (s.leaf[leaf].blocks.empty())
-                    return;
+                size_t stolen_rows = 0;
+                size_t stolen_caps = 0;
+                {
+                    std::lock_guard<std::mutex> lock(leaf_mutexes[leaf]);
+                    for (auto & blk : published_leaves[leaf].blocks)
+                    {
+                        if (blk.rows > 0)
+                        {
+                            stolen_rows += blk.rows;
+                            stolen_caps += blk.capacity;
+                            dst.blocks.push_back(std::move(blk));
+                        }
+                    }
+                    published_leaves[leaf].blocks.clear();
+                    published_leaves[leaf].cur = nullptr;
+                    /// Drain the per-leaf counters inside the mutex
+                    /// so the (chain, counter) pair stays consistent.
+                    published_leaf_rows[leaf].fetch_sub(stolen_rows, std::memory_order_relaxed);
+                    published_leaf_caps[leaf].fetch_sub(stolen_caps, std::memory_order_relaxed);
+                }
+                if (stolen_caps != 0)
+                    global_leaf_cap_rows.fetch_sub(stolen_caps, std::memory_order_relaxed);
+                return stolen_rows;
+            };
+
+            /// Process one leaf-eviction step: pick the globally
+            /// largest published leaf, build its HT if needed,
+            /// steal its chain (under per-leaf mutex), probe it,
+            /// drop. Returns true if forward progress was made,
+            /// false on a skip (claim/build collision or empty
+            /// chain after the steal). On `false` the caller
+            /// re-checks the budget condition; on a sustained
+            /// no-progress streak the caller yields and retries.
+            auto evictOneGlobalLeaf = [&]() -> bool
+            {
+                const TimePoint te0 = now();
+                const size_t leaf = argmaxGlobalLeaf();
+                my_eviction_ns += toNanos(now() - te0);
+                if (leaf == SIZE_MAX)
+                    return false;
+
+                /// CAS-claim BUILD if NOT_BUILT. Workers concurrently
+                /// running this loop converge on the same `leaf`
+                /// from argmax, so the CAS is the natural single-
+                /// claimer point: the winner builds + probes, the
+                /// losers fall through to the next argmax (which
+                /// excludes BUILDING leaves) and pick a different
+                /// target. This is what gives the cooperative leaf
+                /// drain its parallelism.
+                const TimePoint ts0 = now();
+                LeafState st = leaf_states[leaf].load(std::memory_order_acquire);
+                my_eviction_ns += toNanos(now() - ts0);
+
+                if (st == LeafState::BUILDING)
+                {
+                    ++my_skip_retries;
+                    return false;
+                }
+                if (st == LeafState::NOT_BUILT)
+                {
+                    const TimePoint tc0 = now();
+                    LeafState expected = LeafState::NOT_BUILT;
+                    const bool claimed
+                        = leaf_states[leaf].compare_exchange_strong(expected, LeafState::BUILDING, std::memory_order_acq_rel);
+                    my_eviction_ns += toNanos(now() - tc0);
+                    if (!claimed)
+                    {
+                        ++my_skip_retries;
+                        return false;
+                    }
+                    const TimePoint tb0 = now();
+                    buildLeafHt(leaf);
+                    leaf_states[leaf].store(LeafState::BUILT, std::memory_order_release);
+                    my_build_ns += toNanos(now() - tb0);
+                }
+
+                /// HT is BUILT. Cross-worker steal under per-leaf
+                /// mutex: this is the (A) win — every worker's
+                /// contribution to leaf L is processed in a
+                /// single continuous probe sweep with hot HT
+                /// and hot build-side store on this thread.
+                PartitionOut stolen(&tracker);
+                const TimePoint tst0 = now();
+                const size_t stolen_rows = stealLeafChain(leaf, stolen);
+                my_eviction_ns += toNanos(now() - tst0);
+
+                if (stolen_rows == 0)
+                    return false;
+
+                const TimePoint tp0 = now();
                 const JoinHashTable & ht = leaf_hts[leaf];
                 const BlockStore & store = *leaf_stores[leaf];
-                for (const auto & ob : s.leaf[leaf].blocks)
-                {
-                    if (ob.rows == 0)
-                        continue;
-                    probeOneBlock(ob.view(), store, ht, mat, probe_hashes, heads, probe_idx, build_ref);
-                }
+                probeChain(stolen.blocks, store, ht, mat, probe_hashes, heads, probe_idx, build_ref);
+                my_probe_ns += toNanos(now() - tp0);
+
+                const TimePoint td0 = now();
+                dropPartition(stolen);
+                my_eviction_ns += toNanos(now() - td0);
+                ++my_evictions;
+                return true;
             };
 
-            const size_t initial_block_rows = initialOutBlockRows(probe.schema);
-
-            auto dropLeafProbeBuffers = [&](size_t leaf)
+            /// Post-input-block trigger check. Two independent
+            /// hysteresis loops; refinement runs before leaf drain
+            /// because refinement publishes rows from unrefined
+            /// into the shared leaf chains and may push the leaf
+            /// share over the leaf high-water threshold.
+            auto evictAsNeeded = [&]()
             {
-                s.total_rows -= s.leaf_rows[leaf];
-                s.leaf_rows[leaf] = 0;
-                dropPartition(s.leaf[leaf]);
-                /// Reset the doubling-grow progression. Without this
-                /// reset, a leaf that previously grew to a 1 MiB
-                /// OutBlock keeps `next_cap` at `MAX_OUT_BLOCK_ROWS`
-                /// — so the next refinement onto this leaf allocates
-                /// a fresh 1 MiB OutBlock to hold its tiny payload
-                /// (typically ~100 rows when a pass-1 bucket fans out
-                /// across leaves_per_p1 leaves). Across 16 workers ×
-                /// 2048 leaves that pathology compounds into ~30 GiB
-                /// of capacity waste invisible to the filled-row
-                /// budget. Resetting to the initial capacity keeps
-                /// each refill's cap overhead bounded to the
-                /// canonical doubling factor (~2× filled rows worst
-                /// case, ~1.5× on average).
-                s.leaf[leaf].next_cap = initial_block_rows;
-            };
-
-            auto bumpPeak = [&]() noexcept { s.peak_bytes = std::max(s.peak_bytes, allocatedBytes(s)); };
-
-            /// Inner eviction loop: invoked at every input-block boundary
-            /// (and once at end of input, via the drain phase below).
-            /// Returns when total buffered bytes drop below `M`.
-            auto evictUntilUnderBudget = [&]()
-            {
-                while (overBudget(s, budget_bytes))
+                /// Phase 1: drain own unrefined to low water.
+                if (s.unrefined_cap_bytes >= unrefined_high_water_per_worker)
                 {
-                    TimePoint te0 = now();
-                    EvictTarget target = argmaxBuffered(s, leaf_states);
-
-                    if (target.rows == 0)
+                    while (s.unrefined_cap_bytes >= unrefined_low_water_per_worker)
                     {
-                        /// Every non-empty leaf is `BUILDING` elsewhere
-                        /// and no unrefined data remains. Brief backoff.
-                        /// The sleep counts toward `eviction_overhead_ns`
-                        /// per spec ("`BUILDING`-skip / backoff").
-                        ++my_skip_retries;
-                        std::this_thread::sleep_for(std::chrono::microseconds(50));
-                        my_eviction_ns += toNanos(now() - te0);
-                        continue;
-                    }
-                    my_eviction_ns += toNanos(now() - te0);
-
-                    if (target.kind == 0)
-                    {
+                        const size_t p1 = argmaxOwnUnrefined();
+                        if (p1 == SIZE_MAX)
+                            break;
                         const TimePoint trf0 = now();
-                        refinePartition(target.idx);
+                        refinePartition(p1);
                         my_probe_shuffle_ns += toNanos(now() - trf0);
                         ++my_refinements;
-                        continue;
                     }
+                }
 
-                    /// Leaf. Acquire-load state and dispatch.
-                    const TimePoint ts0 = now();
-                    LeafState st = leaf_states[target.idx].load(std::memory_order_acquire);
-                    my_eviction_ns += toNanos(now() - ts0);
-
-                    if (st == LeafState::BUILT)
+                /// Phase 2: cooperative drain of global leaves.
+                /// Bounded no-progress backoff so a worker doesn't
+                /// spin forever if every non-empty leaf is being
+                /// built elsewhere; the brief sleep matches the
+                /// behaviour of the prior single-trigger loop.
+                if (leafShareBytes() >= leaf_share_high_water_per_worker)
+                {
+                    size_t consecutive_no_progress = 0;
+                    while (leafShareBytes() >= leaf_share_low_water_per_worker)
                     {
-                        const TimePoint tp0 = now();
-                        processPartition(target.idx);
-                        my_probe_ns += toNanos(now() - tp0);
-                        const TimePoint td0 = now();
-                        dropLeafProbeBuffers(target.idx);
-                        my_eviction_ns += toNanos(now() - td0);
-                        ++my_evictions;
-                        continue;
-                    }
-                    if (st == LeafState::NOT_BUILT)
-                    {
-                        const TimePoint tc0 = now();
-                        LeafState expected = LeafState::NOT_BUILT;
-                        const bool claimed
-                            = leaf_states[target.idx].compare_exchange_strong(expected, LeafState::BUILDING, std::memory_order_acq_rel);
-                        my_eviction_ns += toNanos(now() - tc0);
-                        if (claimed)
+                        if (evictOneGlobalLeaf())
+                        {
+                            consecutive_no_progress = 0;
+                        }
+                        else if (++consecutive_no_progress >= 16)
                         {
                             const TimePoint tb0 = now();
-                            buildLeafHt(target.idx);
-                            leaf_states[target.idx].store(LeafState::BUILT, std::memory_order_release);
-                            my_build_ns += toNanos(now() - tb0);
-
-                            const TimePoint tp0 = now();
-                            processPartition(target.idx);
-                            my_probe_ns += toNanos(now() - tp0);
-                            const TimePoint td0 = now();
-                            dropLeafProbeBuffers(target.idx);
-                            my_eviction_ns += toNanos(now() - td0);
-                            ++my_evictions;
-                            continue;
+                            std::this_thread::sleep_for(std::chrono::microseconds(50));
+                            my_eviction_ns += toNanos(now() - tb0);
+                            consecutive_no_progress = 0;
                         }
-                        ++my_skip_retries;
-                        continue;
                     }
-                    /// Raced into `BUILDING` between argmax and load.
-                    ++my_skip_retries;
                 }
             };
 
@@ -519,25 +732,59 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                 /// Pass-1 scatter of one input block into unrefined chains.
                 const TimePoint tps0 = now();
                 scatterBatch(blk.view(), probe_identity, probe.schema, pass1_shift, P, s.unrefined.data(), scatter_scratch);
-                /// `scatter_scratch.local_hist[p]` is the per-partition
-                /// row delta for this batch.
                 for (size_t p = 0; p < P; ++p)
                 {
                     const size_t delta = scatter_scratch.local_hist[p];
                     if (delta == 0)
                         continue;
                     s.unrefined_rows[p] += delta;
-                    s.total_rows += delta;
                 }
-                bumpPeak();
+                /// Refresh cached unrefined cap bytes after scatter
+                /// (a `grow()` may have been triggered inside
+                /// `scatterBatch`) and mirror the delta into the
+                /// global aggregate, then refresh the global peak.
+                refreshUnrefinedCapBytes();
+                bumpGlobalPeak();
                 my_probe_shuffle_ns += toNanos(now() - tps0);
 
-                evictUntilUnderBudget();
+                evictAsNeeded();
             }
 
-            /// -------- END-OF-INPUT DRAIN --------
+            /// -------- COOPERATIVE END-OF-SLICE DRAIN --------
+            /// This worker has finished its input slice. Before
+            /// refining its own leftover unrefined (which would
+            /// publish more rows into shared leaves and then trip
+            /// other workers' triggers), help drain the global
+            /// leaves as long as at least one other worker is
+            /// still scattering. This converts the natural barrier
+            /// idle time into useful eviction work and balances
+            /// the cross-worker probe load.
+            scatter_workers_active.fetch_sub(1, std::memory_order_acq_rel);
+            while (scatter_workers_active.load(std::memory_order_acquire) > 0)
+            {
+                if (leafShareBytes() >= leaf_share_low_water_per_worker)
+                {
+                    if (!evictOneGlobalLeaf())
+                    {
+                        const TimePoint tb0 = now();
+                        std::this_thread::yield();
+                        my_eviction_ns += toNanos(now() - tb0);
+                    }
+                }
+                else
+                {
+                    const TimePoint tb0 = now();
+                    std::this_thread::yield();
+                    my_eviction_ns += toNanos(now() - tb0);
+                }
+            }
+
+            /// -------- END-OF-INPUT REFINEMENT --------
             /// Force-refine every pass-1 partition that still holds
-            /// rows. Per-worker only, no cross-worker contention.
+            /// rows. Publishes into shared leaves under per-leaf
+            /// mutexes (other workers may still be draining their
+            /// own pass-1 buffers here, but contention on the same
+            /// leaf is rare and brief).
             for (size_t p1 = 0; p1 < P; ++p1)
             {
                 if (s.unrefined_rows[p1] == 0)
@@ -548,86 +795,41 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                 ++my_refinements;
             }
 
-            /// End of parallelRun #1. The old per-worker leaf drain
-            /// (offset-stepped walk with CAS-claimed builds and a
-            /// pending/backoff loop) has been replaced by the second
-            /// parallelRun below, which restores PHJ's single-owner-
-            /// per-partition build+probe by work-stealing leaves and
-            /// merging the per-worker `s.leaf[L]` chains lazily under
-            /// fetch_add-exclusive ownership.
             ns_build[tid] = my_build_ns;
             ns_probe_shuffle[tid] = my_probe_shuffle_ns;
             ns_probe[tid] = my_probe_ns;
             ns_eviction[tid] = my_eviction_ns;
             worker_evictions[tid] = my_evictions;
             worker_refinements[tid] = my_refinements;
-            worker_peak_bytes[tid] = s.peak_bytes;
             worker_skip_retries[tid] = my_skip_retries;
         });
 
     /// -------- POST-SCATTER HT CLEANUP --------
     /// parallelRun #1 has joined, so no concurrent reader of `leaf_hts`
-    /// or `leaf_stores` can exist. Eagerly free leaves whose buffered
-    /// probe-side rows were fully processed by mid-stream eviction —
-    /// they have no residual that the drain needs to probe, so the HT
-    /// and BlockStore are dead weight that would otherwise sit live
-    /// throughout the drain (the drain frees them lazily inside its
-    /// loop, but the run peak is reached at the start of the drain).
-    ///
-    /// Without this pass, under tight budgets all `total_leaves` HTs
-    /// end up built during scatter (cumulative `evictUntilUnderBudget`
-    /// calls) and stay alive into the drain. With this pass, only
-    /// leaves with non-zero residual survive into the drain. Tight-
-    /// budget workloads often see this loop free nothing (every leaf
-    /// has some residual in some worker); the loop cost is O(threads
-    /// × total_leaves) reads with no atomics, sub-millisecond at
-    /// realistic scale.
+    /// or `leaf_stores` can exist. Eagerly free leaves whose published
+    /// chain holds no residual: those are leaves that mid-stream
+    /// eviction processed completely (HT was built but no probe rows
+    /// remain for the drain). Without this pass, all `total_leaves`
+    /// HTs that were built during scatter would stay alive into the
+    /// drain.
     for (size_t L = 0; L < total_leaves; ++L)
     {
-        size_t residual_rows = 0;
-        for (const auto & s : worker_states)
-            residual_rows += s.leaf_rows[L];
-        if (residual_rows != 0)
+        if (published_leaf_rows[L].load(std::memory_order_relaxed) != 0)
             continue;
         /// Tracker-backed assignment so the cells buffer is actually
         /// released. Assigning from a default-constructed JHT (which
         /// uses `get_default_resource()`) would NOT free the buffer
-        /// because `polymorphic_allocator::POCMA = false` requires
-        /// equal allocators for move-assign to steal — and an unequal
-        /// allocator falls back to in-place clear, leaving the cells
-        /// allocation alive on the tracker.
+        /// because `polymorphic_allocator::POCMA = false`.
         leaf_hts[L] = JoinHashTable(&tracker);
         leaf_stores[L].reset();
     }
 
     /// -------- WORK-STEALING DRAIN (PHJ-EQUIVALENT) --------
     /// Mid-stream eviction has already processed (and dropped) the
-    /// slices it was forced to flush; whatever remains lives in each
-    /// worker's `s.leaf[L]` chains. We now drain that residual exactly
-    /// like PHJ drains its post-shuffle partitions:
-    ///
-    ///   1. A shared atomic `next_drain_leaf` work-steals leaves. Each
-    ///      successful `fetch_add` gives the calling worker exclusive
-    ///      ownership of leaf L for the drain phase — no other worker
-    ///      will read `worker_states[*].leaf[L]` once this one starts.
-    ///
-    ///   2. The worker lazily cross-merges leaf L by walking every
-    ///      `worker_states[t].leaf[L]` and moving its OutBlocks into a
-    ///      local chain. Since the merge moves blocks (no copies) and
-    ///      the per-worker chains are unobserved by anyone else, no
-    ///      synchronisation is required.
-    ///
-    ///   3. If mid-stream eviction never built leaf L's HT, the
-    ///      claiming worker builds it now. The fetch_add already
-    ///      guarantees uniqueness, so the CAS dance from the old drain
-    ///      collapses to a plain store of `BUILT`.
-    ///
-    ///   4. The merged chain is probed end-to-end against the leaf's
-    ///      shared HT, with build and probe staying on the same worker
-    ///      for any leaf that was lazy-built in step 3 (HT-hot cache,
-    ///      matching PHJ). For leaves whose HT was already built mid-
-    ///      stream the worker pays the same cold-HT cost this BEP path
-    ///      has always paid for those leaves.
+    /// slices it was forced to flush; whatever remains lives in the
+    /// shared `published_leaves[L]` chains. We drain that residual
+    /// in PHJ-style: one fetch_add-claimed leaf per worker, build
+    /// HT if NOT_BUILT, probe end-to-end.
     parallelRun(
         threads,
         [&](size_t tid)
@@ -642,13 +844,9 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
 
             uint64_t my_build_ns = 0;
             uint64_t my_probe_ns = 0;
-            uint64_t my_probe_shuffle_ns = 0;
             uint64_t my_eviction_ns = 0;
             size_t my_evictions = 0;
 
-            /// Re-declared here (rather than hoisted as a free function)
-            /// so each drain worker has its own scratch hashes vector
-            /// captured by reference.
             auto buildLeafHt = [&](size_t leaf)
             {
                 BlockStore & store = *leaf_stores[leaf];
@@ -670,60 +868,35 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                 if (L >= total_leaves)
                     break;
 
-                /// Lazy cross-worker merge for leaf L. fetch_add gave
-                /// us exclusive ownership of `worker_states[*].leaf[L]`
-                /// for the drain phase, so the moves below need no
-                /// synchronisation. The merge time is attributed to
-                /// `probe_shuffle` since it's the analogue of PHJ's
-                /// probe-side shuffle for this leaf.
-                const TimePoint tm0 = now();
-                PartitionOut merged(&tracker);
-                size_t merged_rows = 0;
-                for (size_t t = 0; t < threads; ++t)
+                /// Steal the leaf's residual chain. parallelRun #1
+                /// has joined, so `published_leaves[L]` is now
+                /// only modifiable by us — no lock needed.
+                PartitionOut stolen(&tracker);
+                size_t stolen_rows = 0;
+                for (auto & blk : published_leaves[L].blocks)
                 {
-                    auto & src = worker_states[t].leaf[L];
-                    for (auto & blk : src.blocks)
+                    if (blk.rows > 0)
                     {
-                        if (blk.rows > 0)
-                        {
-                            merged_rows += blk.rows;
-                            merged.blocks.push_back(std::move(blk));
-                        }
+                        stolen_rows += blk.rows;
+                        stolen.blocks.push_back(std::move(blk));
                     }
-                    src.blocks.clear();
-                    src.cur = nullptr;
                 }
-                my_probe_shuffle_ns += toNanos(now() - tm0);
+                published_leaves[L].blocks.clear();
+                published_leaves[L].cur = nullptr;
 
-                if (merged_rows == 0)
+                if (stolen_rows == 0)
                 {
-                    /// No residual probe rows for this leaf — either
-                    /// it was empty all along (build had no rows
-                    /// either) or mid-stream eviction already processed
-                    /// every worker's slice. Either way, the HT and
-                    /// store are no longer needed; release them so the
-                    /// drain doesn't keep up to `total_leaves` HTs
-                    /// alive simultaneously.
-                    /// IMPORTANT: assign from a tracker-backed JHT, not
-                    /// a default-constructed one. `polymorphic_allocator`
-                    /// has `POCMA = false` and the allocators must compare
-                    /// equal for the move-assignment to steal (and free)
-                    /// the existing cells buffer. A default JHT uses
-                    /// `get_default_resource()` which is unequal to our
-                    /// `&tracker`, so its move-assignment only clears
-                    /// `size` to 0 while leaving the (potentially 2 MiB)
-                    /// cells allocation alive on the tracker.
+                    /// No residual probe rows. HT and store may
+                    /// already have been freed in the post-scatter
+                    /// cleanup; if not (because the leaf was built
+                    /// mid-stream and had subsequent residual that
+                    /// got cleared between cleanup and drain), free
+                    /// them now.
                     leaf_hts[L] = JoinHashTable(&tracker);
                     leaf_stores[L].reset();
                     continue;
                 }
 
-                /// Acquire-load tracks whether mid-stream eviction
-                /// already built this leaf's HT (it may have done so on
-                /// another worker, in which case we just probe). The
-                /// fetch_add above plus the parallelRun #1 join provides
-                /// the necessary happens-before so no CAS-claim is
-                /// required to write `BUILT`.
                 if (leaf_states[L].load(std::memory_order_acquire) == LeafState::NOT_BUILT)
                 {
                     const TimePoint tb0 = now();
@@ -732,37 +905,16 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                     my_build_ns += toNanos(now() - tb0);
                 }
 
-                /// Probe the merged chain end-to-end. For leaves we
-                /// just built, HT + BlockStore are hot in this worker's
-                /// cache (PHJ-equivalent behaviour); for leaves built
-                /// mid-stream by another worker they arrive cold.
                 const TimePoint tp0 = now();
                 const JoinHashTable & ht = leaf_hts[L];
                 const BlockStore & store = *leaf_stores[L];
-                for (const auto & ob : merged.blocks)
-                {
-                    if (ob.rows == 0)
-                        continue;
-                    probeOneBlock(ob.view(), store, ht, mat, probe_hashes, heads, probe_idx, build_ref);
-                }
+                probeChain(stolen.blocks, store, ht, mat, probe_hashes, heads, probe_idx, build_ref);
                 my_probe_ns += toNanos(now() - tp0);
 
-                /// Releasing the merged chain destroys its OutBlocks
-                /// (and their keys/payload vectors). We also free the
-                /// leaf's HT and build-side store now that the drain
-                /// is done with them: `ProbeMaterialiser` has already
-                /// copied every matched build payload by value into
-                /// the output blocks, so no dangling reference remains.
-                /// This matches PHJ's stack-local HT lifetime — only
-                /// the leaves currently in flight occupy memory,
-                /// rather than 2048 simultaneously-allocated HTs
-                /// piling up heap fragmentation across the drain.
-                /// Counted as eviction overhead to match the old
-                /// drain's accounting of `dropLeafProbeBuffers` calls.
                 const TimePoint td0 = now();
-                dropPartition(merged);
-                /// Tracker-backed assignment so the move-assign can steal
-                /// and free the cells buffer (see note above).
+                dropPartition(stolen);
+                /// Tracker-backed assignment so the move-assign can
+                /// steal and free the cells buffer.
                 leaf_hts[L] = JoinHashTable(&tracker);
                 leaf_stores[L].reset();
                 my_eviction_ns += toNanos(now() - td0);
@@ -771,11 +923,7 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
 
             mat.finish();
 
-            /// The drain runs after parallelRun #1 has already written
-            /// the mid-stream tallies; accumulate the drain's per-
-            /// thread totals on top.
             ns_build[tid] += my_build_ns;
-            ns_probe_shuffle[tid] += my_probe_shuffle_ns;
             ns_probe[tid] += my_probe_ns;
             ns_eviction[tid] += my_eviction_ns;
             worker_evictions[tid] += my_evictions;
@@ -827,14 +975,13 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
     result.bep_evictions = 0;
     result.bep_refinements = 0;
     result.bep_build_skip_retries = 0;
-    result.bep_peak_bytes = 0;
     for (size_t t = 0; t < threads; ++t)
     {
         result.bep_evictions += worker_evictions[t];
         result.bep_refinements += worker_refinements[t];
         result.bep_build_skip_retries += worker_skip_retries[t];
-        result.bep_peak_bytes = std::max(result.bep_peak_bytes, worker_peak_bytes[t]);
     }
+    result.bep_peak_bytes = global_peak_probe_bytes.load(std::memory_order_relaxed);
 
     result.peak_mem_bytes = tracker.peakBytes();
 
