@@ -59,6 +59,13 @@ struct Row
 };
 
 
+struct SchemeFooter
+{
+    Stats peak_mem_mib;
+    bool present = false;
+};
+
+
 struct BepFooter
 {
     size_t bep_budget_mib = 0;
@@ -71,7 +78,12 @@ struct BepFooter
 
 
 void printSchemeTable(
-    std::ostream & os, const std::string & scheme, const std::vector<Row> & rows, Stats e2e_ms, const BepFooter & bep = {})
+    std::ostream & os,
+    const std::string & scheme,
+    const std::vector<Row> & rows,
+    Stats e2e_ms,
+    const SchemeFooter & sfooter = {},
+    const BepFooter & bep = {})
 {
     os << "\nScheme: " << scheme << "\n";
 
@@ -115,6 +127,17 @@ void printSchemeTable(
         writeCell("");
         os << "\n";
     }
+    if (sfooter.present && sfooter.peak_mem_mib.present)
+    {
+        writePhase("peak_mem_mib");
+        writeCell(formatDouble(sfooter.peak_mem_mib.med, 1));
+        writeCell(formatDouble(sfooter.peak_mem_mib.min, 1));
+        writeCell(formatDouble(sfooter.peak_mem_mib.max, 1));
+        writeCell("");
+        writeCell("");
+        writeCell("");
+        os << "\n";
+    }
     os << std::string(16 + COL_WIDTH * 6, '-') << "\n";
 
     if (bep.present)
@@ -151,13 +174,14 @@ void printSchemeTable(
 }
 
 
-std::vector<Row> chjRows(const std::vector<ChjResult> & reps, Stats & e2e_out)
+std::vector<Row> chjRows(const std::vector<ChjResult> & reps, Stats & e2e_out, SchemeFooter & sfooter)
 {
     std::vector<double> build_ms;
     std::vector<double> build_ns;
     std::vector<double> probe_ms;
     std::vector<double> probe_ns;
     std::vector<double> e2e_ms;
+    std::vector<double> peaks;
     for (const auto & r : reps)
     {
         build_ms.push_back(r.build.wall_ms);
@@ -165,8 +189,11 @@ std::vector<Row> chjRows(const std::vector<ChjResult> & reps, Stats & e2e_out)
         probe_ms.push_back(r.probe.wall_ms);
         probe_ns.push_back(r.probe.ns_per_row);
         e2e_ms.push_back(r.e2e_wall_ms);
+        peaks.push_back(bytesToMib(r.peak_mem_bytes));
     }
     e2e_out = computeStats(e2e_ms);
+    sfooter.present = true;
+    sfooter.peak_mem_mib = computeStats(peaks);
     return {
         {"build", computeStats(build_ms), computeStats(build_ns)},
         {"probe", computeStats(probe_ms), computeStats(probe_ns)},
@@ -174,7 +201,7 @@ std::vector<Row> chjRows(const std::vector<ChjResult> & reps, Stats & e2e_out)
 }
 
 
-std::vector<Row> phjRows(const std::vector<PhjResult> & reps, Stats & e2e_out)
+std::vector<Row> phjRows(const std::vector<PhjResult> & reps, Stats & e2e_out, SchemeFooter & sfooter)
 {
     std::vector<double> bs_ms;
     std::vector<double> bs_ns;
@@ -185,6 +212,7 @@ std::vector<Row> phjRows(const std::vector<PhjResult> & reps, Stats & e2e_out)
     std::vector<double> p_ms;
     std::vector<double> p_ns;
     std::vector<double> e2e_ms;
+    std::vector<double> peaks;
     for (const auto & r : reps)
     {
         bs_ms.push_back(r.build_shuffle.wall_ms);
@@ -196,8 +224,11 @@ std::vector<Row> phjRows(const std::vector<PhjResult> & reps, Stats & e2e_out)
         p_ms.push_back(r.probe.wall_ms);
         p_ns.push_back(r.probe.ns_per_row);
         e2e_ms.push_back(r.e2e_wall_ms);
+        peaks.push_back(bytesToMib(r.peak_mem_bytes));
     }
     e2e_out = computeStats(e2e_ms);
+    sfooter.present = true;
+    sfooter.peak_mem_mib = computeStats(peaks);
     return {
         {"build-shuffle", computeStats(bs_ms), computeStats(bs_ns)},
         {"build", computeStats(b_ms), computeStats(b_ns)},
@@ -207,7 +238,7 @@ std::vector<Row> phjRows(const std::vector<PhjResult> & reps, Stats & e2e_out)
 }
 
 
-std::vector<Row> bepRows(const std::vector<PhjBepResult> & reps, Stats & e2e_out, BepFooter & footer)
+std::vector<Row> bepRows(const std::vector<PhjBepResult> & reps, Stats & e2e_out, SchemeFooter & sfooter, BepFooter & footer)
 {
     std::vector<double> bs_ms;
     std::vector<double> bs_ns;
@@ -222,8 +253,9 @@ std::vector<Row> bepRows(const std::vector<PhjBepResult> & reps, Stats & e2e_out
     std::vector<double> e2e_ms;
     std::vector<double> evicts;
     std::vector<double> refines;
-    std::vector<double> peaks;
+    std::vector<double> bep_peaks;
     std::vector<double> skips;
+    std::vector<double> peaks;
     for (const auto & r : reps)
     {
         bs_ms.push_back(r.build_shuffle.wall_ms);
@@ -239,15 +271,18 @@ std::vector<Row> bepRows(const std::vector<PhjBepResult> & reps, Stats & e2e_out
         e2e_ms.push_back(r.e2e_wall_ms);
         evicts.push_back(static_cast<double>(r.bep_evictions));
         refines.push_back(static_cast<double>(r.bep_refinements));
-        peaks.push_back(bytesToMib(r.bep_peak_bytes));
+        bep_peaks.push_back(bytesToMib(r.bep_peak_bytes));
         skips.push_back(static_cast<double>(r.bep_build_skip_retries));
+        peaks.push_back(bytesToMib(r.peak_mem_bytes));
     }
     e2e_out = computeStats(e2e_ms);
+    sfooter.present = true;
+    sfooter.peak_mem_mib = computeStats(peaks);
     footer.present = true;
     footer.bep_budget_mib = reps.empty() ? 0 : reps.front().bep_budget_mib;
     footer.evictions = computeStats(evicts);
     footer.refinements = computeStats(refines);
-    footer.peak_mib = computeStats(peaks);
+    footer.peak_mib = computeStats(bep_peaks);
     footer.skip_retries = computeStats(skips);
     return {
         {"build-shuffle", computeStats(bs_ms), computeStats(bs_ns)},
@@ -304,21 +339,24 @@ void printSummary(
     if (!chj_reps.empty())
     {
         Stats e2e;
-        auto rows = chjRows(chj_reps, e2e);
-        printSchemeTable(os, "CHJ", rows, e2e);
+        SchemeFooter sfooter;
+        auto rows = chjRows(chj_reps, e2e, sfooter);
+        printSchemeTable(os, "CHJ", rows, e2e, sfooter);
     }
     if (!phj_reps.empty())
     {
         Stats e2e;
-        auto rows = phjRows(phj_reps, e2e);
-        printSchemeTable(os, "PHJ-PURE", rows, e2e);
+        SchemeFooter sfooter;
+        auto rows = phjRows(phj_reps, e2e, sfooter);
+        printSchemeTable(os, "PHJ-PURE", rows, e2e, sfooter);
     }
     if (!bep_reps.empty())
     {
         Stats e2e;
+        SchemeFooter sfooter;
         BepFooter footer;
-        auto rows = bepRows(bep_reps, e2e, footer);
-        printSchemeTable(os, "PHJ", rows, e2e, footer);
+        auto rows = bepRows(bep_reps, e2e, sfooter, footer);
+        printSchemeTable(os, "PHJ", rows, e2e, sfooter, footer);
     }
 }
 
@@ -348,7 +386,7 @@ void writeCsv(
              "build_wall_ms,build_ns_per_row,probe_wall_ms,probe_ns_per_row,"
              "build_shuffle_wall_ms,build_shuffle_ns_per_row,probe_shuffle_wall_ms,probe_shuffle_ns_per_row,"
              "eviction_overhead_wall_ms,eviction_overhead_ns_per_row,"
-             "e2e_wall_ms,"
+             "e2e_wall_ms,peak_mem_mib,"
              "bep_budget_mib,bep_evictions,bep_refinements,bep_peak_mib,bep_build_skip_retries\n";
     }
 
@@ -388,6 +426,7 @@ void writeCsv(
         emitBlank(); /* eviction_overhead_wall_ms */
         emitBlank(); /* eviction_overhead_ns_per_row */
         emit(r.e2e_wall_ms);
+        emit(bytesToMib(r.peak_mem_bytes)); /* peak_mem_mib */
         emitBlank(); /* bep_budget_mib */
         emitBlank(); /* bep_evictions */
         emitBlank(); /* bep_refinements */
@@ -410,6 +449,7 @@ void writeCsv(
         emitBlank(); /* eviction_overhead_wall_ms */
         emitBlank(); /* eviction_overhead_ns_per_row */
         emit(r.e2e_wall_ms);
+        emit(bytesToMib(r.peak_mem_bytes)); /* peak_mem_mib */
         emitBlank(); /* bep_budget_mib */
         emitBlank(); /* bep_evictions */
         emitBlank(); /* bep_refinements */
@@ -432,6 +472,7 @@ void writeCsv(
         emit(r.eviction_overhead.wall_ms);
         emit(r.eviction_overhead.ns_per_row);
         emit(r.e2e_wall_ms);
+        emit(bytesToMib(r.peak_mem_bytes)); /* peak_mem_mib */
         emitInt(r.bep_budget_mib);
         emitInt(r.bep_evictions);
         emitInt(r.bep_refinements);

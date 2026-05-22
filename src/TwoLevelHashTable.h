@@ -2,6 +2,8 @@
 
 #include <array>
 #include <cstddef>
+#include <memory>
+#include <memory_resource>
 #include <mutex>
 
 #include "HashTable.h"
@@ -15,6 +17,9 @@ namespace phj
 /// independently. `insertLocked` is the parallel-safe insert path;
 /// `find` is mutex-free (assumes the table is read-only after the
 /// global build/probe barrier).
+///
+/// Pass a `memory_resource*` to the constructor to route all sub-table
+/// cell allocations through the caller's tracker.
 class TwoLevelJoinHashTable
 {
 public:
@@ -24,6 +29,22 @@ public:
     using Hash = JoinHashTable::Hash;
     using Key = JoinHashTable::Key;
     using Ref = JoinHashTable::Ref;
+
+    TwoLevelJoinHashTable() = default;
+
+    /// Reconstruct every sub-table in-place so that their cell vectors
+    /// use `mr`. The array elements are default-constructed first
+    /// (empty cells, default resource); we then destroy and re-construct
+    /// each one with `mr`. Since all cell vectors are empty at that
+    /// point no heap traffic occurs during the switch.
+    explicit TwoLevelJoinHashTable(std::pmr::memory_resource * mr)
+    {
+        for (auto & sub : subs)
+        {
+            std::destroy_at(&sub);
+            std::construct_at(&sub, mr);
+        }
+    }
 
     [[gnu::always_inline]] static constexpr size_t bucketOf(Hash h) noexcept { return static_cast<size_t>(h >> 56); }
 

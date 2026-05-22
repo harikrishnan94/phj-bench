@@ -22,6 +22,7 @@ struct PhjBepResult
     PhaseTiming eviction_overhead;
 
     double e2e_wall_ms = 0.0;
+    size_t peak_mem_bytes = 0;
     JoinOutput output;
 
     /// BEP-specific per-run metrics. Empty in PHJ rows; populated here.

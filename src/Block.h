@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory_resource>
 #include <vector>
 
 #include "Types.h"
@@ -13,10 +14,48 @@ namespace phj
 /// A single column inside a Block. Type-erased: the column knows its
 /// element type and stores `rows * elementSize()` bytes of contiguous
 /// payload values. All payload columns in the pipeline are column-major.
+///
+/// Column is allocator-aware (allocator_type = polymorphic_allocator<>)
+/// so that pmr containers of Columns propagate their resource into each
+/// Column's data vector at construction time.
 struct Column
 {
+    using allocator_type = std::pmr::polymorphic_allocator<>;
+
     PayloadType type = PayloadType::UInt8;
-    std::vector<std::byte> data;
+    std::pmr::vector<std::byte> data;
+
+    Column()
+        : data(std::pmr::get_default_resource())
+    {
+    }
+    explicit Column(std::pmr::memory_resource * mr)
+        : data(mr)
+    {
+    }
+
+    /// Allocator-extended constructors used by pmr containers.
+    Column(std::allocator_arg_t, allocator_type const & alloc)
+        : data(alloc)
+    {
+    }
+
+    Column(const Column & o, allocator_type const & alloc)
+        : type(o.type)
+        , data(o.data, alloc)
+    {
+    }
+
+    Column(Column && o, allocator_type const & alloc)
+        : type(o.type)
+        , data(std::move(o.data), alloc)
+    {
+    }
+
+    Column(const Column &) = default;
+    Column(Column &&) noexcept = default;
+    Column & operator=(const Column &) = default;
+    Column & operator=(Column &&) noexcept = default;
 
     [[nodiscard]] size_t elementSize() const noexcept { return payloadTypeSize(type); }
     [[nodiscard]] std::byte * raw() noexcept { return data.data(); }
@@ -45,11 +84,53 @@ struct BlockView
 /// partition operator consumes them as batches and produces per-
 /// partition `OutBlock` chains, and the build/probe operators consume
 /// them one at a time.
+///
+/// Block is allocator-aware so that pmr containers of Blocks propagate
+/// their resource into each Block's key and payload vectors.
 struct Block
 {
+    using allocator_type = std::pmr::polymorphic_allocator<>;
+
     size_t rows = 0;
-    std::vector<uint64_t> keys;
-    std::vector<Column> payloads;
+    std::pmr::vector<uint64_t> keys;
+    std::pmr::vector<Column> payloads;
+
+    Block()
+        : keys(std::pmr::get_default_resource())
+        , payloads(std::pmr::get_default_resource())
+    {
+    }
+    explicit Block(std::pmr::memory_resource * mr)
+        : keys(mr)
+        , payloads(mr)
+    {
+    }
+
+    /// Allocator-extended constructors used by pmr containers.
+    Block(std::allocator_arg_t, allocator_type const & alloc)
+        : keys(alloc)
+        , payloads(alloc)
+    {
+    }
+
+    Block(const Block & o, allocator_type const & alloc)
+        : rows(o.rows)
+        , keys(o.keys, alloc)
+        , payloads(o.payloads, alloc)
+    {
+    }
+
+    Block(Block && o, allocator_type const & alloc)
+        : rows(o.rows)
+        , keys(std::move(o.keys), alloc)
+        , payloads(std::move(o.payloads), alloc)
+    {
+    }
+
+    Block(const Block &) = default;
+    Block(Block &&) noexcept = default;
+    Block & operator=(const Block &) = default;
+    Block & operator=(Block &&) noexcept = default;
 
     void init(const PayloadSchema & schema, size_t row_count)
     {

@@ -8,6 +8,7 @@
 #include "BlockStore.h"
 #include "HashTable.h"
 #include "JoinOps.h"
+#include "MemTracker.h"
 #include "Threading.h"
 #include "Timer.h"
 
@@ -20,6 +21,8 @@ PhjResult runPHJ(const BlockStream & build, const BlockStream & probe, const Rad
     if (threads == 0)
         threads = 1;
 
+    MemTracker tracker;
+
     PhjResult result;
     result.output.left_schema = build.schema;
     result.output.right_schema = probe.schema;
@@ -29,12 +32,12 @@ PhjResult runPHJ(const BlockStream & build, const BlockStream & probe, const Rad
 
     /// -------- BUILD SHUFFLE --------
     const TimePoint t_bs0 = now();
-    PartitionedShuffleOutput build_part = radixShuffle(build, cfg, threads);
+    PartitionedShuffleOutput build_part = radixShuffle(build, cfg, threads, &tracker);
     const TimePoint t_bs1 = now();
 
     /// -------- PROBE SHUFFLE --------
     const TimePoint t_ps0 = now();
-    PartitionedShuffleOutput probe_part = radixShuffle(probe, cfg, threads);
+    PartitionedShuffleOutput probe_part = radixShuffle(probe, cfg, threads, &tracker);
     const TimePoint t_ps1 = now();
 
     const size_t partitions = build_part.partitions;
@@ -55,11 +58,11 @@ PhjResult runPHJ(const BlockStream & build, const BlockStream & probe, const Rad
             ProbeMaterialiser mat;
             mat.init(build.schema, probe.schema, result.output.workers[tid], PIPELINE_BLOCK_ROWS);
 
-            std::vector<uint64_t> hashes;
-            std::vector<uint64_t> probe_hashes;
-            std::vector<RowRefCell> heads;
-            std::vector<size_t> probe_idx;
-            std::vector<RowRefCell> build_ref;
+            std::pmr::vector<uint64_t> hashes(&tracker);
+            std::pmr::vector<uint64_t> probe_hashes(&tracker);
+            std::pmr::vector<RowRefCell> heads(&tracker);
+            std::pmr::vector<size_t> probe_idx(&tracker);
+            std::pmr::vector<RowRefCell> build_ref(&tracker);
 
             while (true)
             {
@@ -70,15 +73,17 @@ PhjResult runPHJ(const BlockStream & build, const BlockStream & probe, const Rad
                 /// ----- BUILD this partition -----
                 const TimePoint tb0 = now();
 
-                BlockStore store;
+                BlockStore store(&tracker);
                 store.reserveBlocks(build_part.chains[p].blocks.size());
-                JoinHashTable ht;
+                JoinHashTable ht(&tracker);
                 if (build_part.partition_rows[p] > 0)
                     ht.reserve(build_part.partition_rows[p]);
 
                 /// Drain the shuffle output blocks one at a time into
                 /// the partition's block store, vectorised-hashing and
-                /// batched-inserting as we go.
+                /// batched-inserting as we go. `outBlockToBlock` moves
+                /// the OutBlock's key/payload buffers into a Block using
+                /// the same memory resource (tracker) — an O(1) steal.
                 for (auto & ob : build_part.chains[p].blocks)
                 {
                     Block as_block = outBlockToBlock(std::move(ob));
@@ -139,6 +144,7 @@ PhjResult runPHJ(const BlockStream & build, const BlockStream & probe, const Rad
     result.probe.ns_per_row = probe.total_rows == 0 ? 0.0 : static_cast<double>(sum_probe_ns) / static_cast<double>(probe.total_rows);
 
     result.e2e_wall_ms = toMillis(t_e2e1 - t_e2e0);
+    result.peak_mem_bytes = tracker.peakBytes();
 
     return result;
 }

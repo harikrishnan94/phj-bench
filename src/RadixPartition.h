@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory_resource>
 #include <vector>
 
 #include "Block.h"
@@ -37,12 +38,55 @@ struct RadixConfig
 /// filled. The doubling-capacity scheme starts at ~16 KiB per buffer
 /// (per the prior spec) and doubles on each new block subject to
 /// `MAX_OUT_BLOCK_ROWS`.
+///
+/// OutBlock is allocator-aware so that pmr containers of OutBlocks
+/// propagate their resource into each block's key and payload vectors.
 struct OutBlock
 {
+    using allocator_type = std::pmr::polymorphic_allocator<>;
+
     size_t rows = 0;
     size_t capacity = 0;
-    std::vector<uint64_t> keys;
-    std::vector<Column> payloads;
+    std::pmr::vector<uint64_t> keys;
+    std::pmr::vector<Column> payloads;
+
+    OutBlock()
+        : keys(std::pmr::get_default_resource())
+        , payloads(std::pmr::get_default_resource())
+    {
+    }
+    explicit OutBlock(std::pmr::memory_resource * mr)
+        : keys(mr)
+        , payloads(mr)
+    {
+    }
+
+    OutBlock(std::allocator_arg_t, allocator_type const & alloc)
+        : keys(alloc)
+        , payloads(alloc)
+    {
+    }
+
+    OutBlock(const OutBlock & o, allocator_type const & alloc)
+        : rows(o.rows)
+        , capacity(o.capacity)
+        , keys(o.keys, alloc)
+        , payloads(o.payloads, alloc)
+    {
+    }
+
+    OutBlock(OutBlock && o, allocator_type const & alloc)
+        : rows(o.rows)
+        , capacity(o.capacity)
+        , keys(std::move(o.keys), alloc)
+        , payloads(std::move(o.payloads), alloc)
+    {
+    }
+
+    OutBlock(const OutBlock &) = default;
+    OutBlock(OutBlock &&) noexcept = default;
+    OutBlock & operator=(const OutBlock &) = default;
+    OutBlock & operator=(OutBlock &&) noexcept = default;
 
     /// Non-owning view of the OutBlock as a `BlockView`. Exposes only
     /// the first `rows` slots even though the underlying buffers may
@@ -59,10 +103,46 @@ struct OutBlock
 /// phase appends these blocks one at a time into the partition's
 /// `BlockStore`, recording each block's assigned `block_no` so the HT
 /// cells encode `(key, RowRefCell{block_no, row_no})`.
+///
+/// OutBlockChain is allocator-aware so pmr containers propagate their
+/// resource into the chain's block vector.
 struct OutBlockChain
 {
-    std::vector<OutBlock> blocks;
+    using allocator_type = std::pmr::polymorphic_allocator<>;
+
+    std::pmr::vector<OutBlock> blocks;
     size_t total_rows = 0;
+
+    OutBlockChain()
+        : blocks(std::pmr::get_default_resource())
+    {
+    }
+    explicit OutBlockChain(std::pmr::memory_resource * mr)
+        : blocks(mr)
+    {
+    }
+
+    OutBlockChain(std::allocator_arg_t, allocator_type const & alloc)
+        : blocks(alloc)
+    {
+    }
+
+    OutBlockChain(const OutBlockChain & o, allocator_type const & alloc)
+        : blocks(o.blocks, alloc)
+        , total_rows(o.total_rows)
+    {
+    }
+
+    OutBlockChain(OutBlockChain && o, allocator_type const & alloc)
+        : blocks(std::move(o.blocks), alloc)
+        , total_rows(o.total_rows)
+    {
+    }
+
+    OutBlockChain(const OutBlockChain &) = default;
+    OutBlockChain(OutBlockChain &&) noexcept = default;
+    OutBlockChain & operator=(const OutBlockChain &) = default;
+    OutBlockChain & operator=(OutBlockChain &&) noexcept = default;
 };
 
 
@@ -72,9 +152,25 @@ struct PartitionedShuffleOutput
 {
     size_t partitions = 0;
     PayloadSchema schema;
-    /// chains[partition]; populated only once, after the shuffle returns.
-    std::vector<OutBlockChain> chains;
-    std::vector<size_t> partition_rows;
+    std::pmr::vector<OutBlockChain> chains;
+    std::pmr::vector<size_t> partition_rows;
+
+    PartitionedShuffleOutput()
+        : chains(std::pmr::get_default_resource())
+        , partition_rows(std::pmr::get_default_resource())
+    {
+    }
+
+    explicit PartitionedShuffleOutput(std::pmr::memory_resource * mr)
+        : chains(mr)
+        , partition_rows(mr)
+    {
+    }
+
+    PartitionedShuffleOutput(const PartitionedShuffleOutput &) = default;
+    PartitionedShuffleOutput(PartitionedShuffleOutput &&) noexcept = default;
+    PartitionedShuffleOutput & operator=(const PartitionedShuffleOutput &) = default;
+    PartitionedShuffleOutput & operator=(PartitionedShuffleOutput &&) noexcept = default;
 };
 
 
@@ -85,18 +181,22 @@ struct PartitionedShuffleOutput
 ///
 /// Both `keys` and the columns whose types are listed in `schema`
 /// (mapped through `in_col_index`) are scattered into the per-partition
-/// `OutBlock` chains. `cfg` lists the bits per pass.
+/// `OutBlock` chains. `cfg` lists the bits per pass. All intermediate
+/// and output allocations are made through `mr` (defaults to
+/// `new_delete_resource()`).
 PartitionedShuffleOutput radixShuffle(
     const BlockStream & input,
     const PayloadSchema & out_schema,
     const std::vector<size_t> & in_col_index,
     const RadixConfig & cfg,
-    size_t threads);
+    size_t threads,
+    std::pmr::memory_resource * mr = std::pmr::get_default_resource());
 
 
 /// Convenience: shuffle a stream whose schema matches its own output
 /// (identity column map).
-PartitionedShuffleOutput radixShuffle(const BlockStream & input, const RadixConfig & cfg, size_t threads);
+PartitionedShuffleOutput radixShuffle(
+    const BlockStream & input, const RadixConfig & cfg, size_t threads, std::pmr::memory_resource * mr = std::pmr::get_default_resource());
 
 
 /// ============================================================
@@ -122,11 +222,74 @@ PartitionedShuffleOutput radixShuffle(const BlockStream & input, const RadixConf
 /// a vector here for cache-friendlier downstream traversal). The
 /// doubling-capacity scheme starts at ~16 KiB per buffer and doubles
 /// on each new block, capped at `MAX_OUT_BLOCK_ROWS`.
+///
+/// PartitionOut is allocator-aware so that pmr containers of
+/// PartitionOuts propagate their resource into each chain's block
+/// vector (and transitively into each OutBlock's key/payload vectors).
 struct PartitionOut
 {
-    std::vector<OutBlock> blocks;
+    using allocator_type = std::pmr::polymorphic_allocator<>;
+
+    std::pmr::vector<OutBlock> blocks;
     OutBlock * cur = nullptr;
     size_t next_cap = 0;
+
+    PartitionOut()
+        : blocks(std::pmr::get_default_resource())
+    {
+    }
+    explicit PartitionOut(std::pmr::memory_resource * mr)
+        : blocks(mr)
+    {
+    }
+
+    PartitionOut(std::allocator_arg_t, allocator_type const & alloc)
+        : blocks(alloc)
+    {
+    }
+
+    PartitionOut(const PartitionOut & o, allocator_type const & alloc)
+        : blocks(o.blocks, alloc)
+        , cur(nullptr)
+        , next_cap(o.next_cap)
+    {
+    }
+
+    /// Move with (possibly different) allocator. When `alloc` matches
+    /// the source's resource the blocks buffer is stolen O(1); when
+    /// different the blocks are copied. `cur` is always reset to null
+    /// after a move-with-allocator to avoid a stale pointer.
+    PartitionOut(PartitionOut && o, allocator_type const & alloc)
+        : blocks(std::move(o.blocks), alloc)
+        , cur(nullptr)
+        , next_cap(o.next_cap)
+    {
+        o.cur = nullptr;
+    }
+
+    /// Regular move: steal the buffer (allocator is transferred for
+    /// pmr move-ctor) and null out `cur` on the source.
+    PartitionOut(PartitionOut && o) noexcept
+        : blocks(std::move(o.blocks))
+        , cur(o.cur)
+        , next_cap(o.next_cap)
+    {
+        o.cur = nullptr;
+    }
+
+    PartitionOut(const PartitionOut &) = default;
+    PartitionOut & operator=(const PartitionOut &) = default;
+    PartitionOut & operator=(PartitionOut && o) noexcept
+    {
+        if (this != &o)
+        {
+            blocks = std::move(o.blocks);
+            cur = nullptr;
+            next_cap = o.next_cap;
+            o.cur = nullptr;
+        }
+        return *this;
+    }
 
     /// Initialise an empty chain with `initial_cap` as the next-to-be-
     /// allocated `OutBlock`'s capacity. Must be called before any
@@ -155,14 +318,29 @@ void dropPartition(PartitionOut & po) noexcept;
 
 
 /// Scratch buffers reused across `scatterBatch` calls within one worker.
-/// Each vector is resized on demand to the maximum size seen.
+/// Each vector is resized on demand to the maximum size seen. Constructed
+/// with an explicit resource so all scratch allocations are tracked.
 struct ScatterScratch
 {
-    std::vector<uint64_t> hashes;
-    std::vector<uint32_t> pids;
-    std::vector<uint32_t> local_hist;
-    std::vector<uint64_t *> key_ptrs;
-    std::vector<std::byte *> ptrs_flat;
+    std::pmr::vector<uint64_t> hashes;
+    std::pmr::vector<uint32_t> pids;
+    std::pmr::vector<uint32_t> local_hist;
+    std::pmr::vector<uint64_t *> key_ptrs;
+    std::pmr::vector<std::byte *> ptrs_flat;
+
+    ScatterScratch()
+        : ScatterScratch(std::pmr::get_default_resource())
+    {
+    }
+
+    explicit ScatterScratch(std::pmr::memory_resource * mr)
+        : hashes(mr)
+        , pids(mr)
+        , local_hist(mr)
+        , key_ptrs(mr)
+        , ptrs_flat(mr)
+    {
+    }
 };
 
 
@@ -207,6 +385,8 @@ void scatterBatch(
 ///                     populated in leaf order within this partition's
 ///                     leaf range.
 ///   `scratch`       — reused working buffers.
+///   `mr`            — memory resource for any intermediate chains
+///                     allocated during 3+ pass refinement.
 ///
 /// Refinement preserves the total filled row count (and total byte
 /// content) — it is a pure structural restripe.
@@ -215,7 +395,8 @@ void refineToLeaves(
     const PayloadSchema & schema,
     const std::vector<uint8_t> & pass_bits,
     PartitionOut * leaves_out,
-    ScatterScratch & scratch);
+    ScatterScratch & scratch,
+    std::pmr::memory_resource * mr = std::pmr::get_default_resource());
 
 
 /// Convert one `OutBlock` from a partition's chain into a pipeline
@@ -224,6 +405,10 @@ void refineToLeaves(
 /// is consumed (its key and payload buffers are moved); the resulting
 /// `Block` owns the storage that the build-side `BlockStore` will
 /// then retain across the build/probe lifetime.
+///
+/// The returned Block uses the same memory resource as `ob` so that
+/// the buffer transfer is an O(1) pointer-steal (same allocator) rather
+/// than a copy.
 [[nodiscard]] Block outBlockToBlock(OutBlock && ob);
 
 }

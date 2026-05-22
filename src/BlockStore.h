@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <memory_resource>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -26,10 +27,24 @@ namespace phj
 /// only by the worker that appended that block (the previous-ref
 /// returned by `insertLocked` is a value, not a pointer; no other
 /// worker writes that slot).
+///
+/// All internal allocations (block storage and next-chain row vectors)
+/// are routed through the `memory_resource` supplied at construction,
+/// enabling per-run peak-memory tracking via `MemTracker`.
 class BlockStore
 {
 public:
-    BlockStore() = default;
+    BlockStore()
+        : BlockStore(std::pmr::get_default_resource())
+    {
+    }
+
+    explicit BlockStore(std::pmr::memory_resource * mr)
+        : blocks_(mr)
+        , next_chain_(mr)
+    {
+    }
+
     BlockStore(const BlockStore &) = delete;
     BlockStore & operator=(const BlockStore &) = delete;
     BlockStore(BlockStore &&) = delete;
@@ -74,8 +89,8 @@ public:
     [[nodiscard]] RowRefCell getPrev(RowRefCell ref) const noexcept { return next_chain_[ref.block_no][ref.row_no]; }
 
 private:
-    std::vector<Block> blocks_;
-    std::vector<std::vector<RowRefCell>> next_chain_;
+    std::pmr::vector<Block> blocks_;
+    std::pmr::vector<std::pmr::vector<RowRefCell>> next_chain_;
     std::mutex mu_;
 };
 

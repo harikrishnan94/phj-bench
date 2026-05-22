@@ -17,7 +17,7 @@ namespace
 
 /// Per-(column, partition) live write pointer. The reference uses one
 /// flat ptrs_flat[K*P] array; we keep the same layout here.
-using PtrsFlat = std::vector<std::byte *>;
+using PtrsFlat = std::pmr::vector<std::byte *>;
 
 
 /// Function-pointer scatter: writes `n` values from `src` into the
@@ -75,15 +75,21 @@ void initOutBlock(OutBlock & blk, const PayloadSchema & schema, size_t capacity)
 
 /// A `ThreadShard` is a contiguous span of per-partition `PartitionOut`
 /// chains, one per partition. The radix shuffle owns one per worker.
+/// All chains use the memory resource supplied at construction so that
+/// scatter allocations are routed through the caller's tracker.
 struct ThreadShard
 {
-    /// chains[partition]
-    std::vector<PartitionOut> chains;
+    std::pmr::vector<PartitionOut> chains;
+
+    explicit ThreadShard(std::pmr::memory_resource * mr)
+        : chains(mr)
+    {
+    }
 
     void init(size_t partitions, const PayloadSchema & schema)
     {
         const size_t initial_cap = initialOutBlockRows(schema);
-        chains.assign(partitions, {});
+        chains.resize(partitions);
         for (auto & c : chains)
             c.init(initial_cap);
     }
@@ -113,14 +119,14 @@ struct ThreadShard
 /// partition's output is the concatenation of all threads' OutBlocks
 /// for that partition (in thread-id order; the within-thread order is
 /// preserved). Each block keeps its grown capacity; `rows` is the
-/// number of slots filled.
-PartitionedShuffleOutput collectChains(std::vector<ThreadShard> shards, const PayloadSchema & out_schema)
+/// number of slots filled. All output allocations use `mr`.
+PartitionedShuffleOutput collectChains(std::vector<ThreadShard> & shards, const PayloadSchema & out_schema, std::pmr::memory_resource * mr)
 {
-    PartitionedShuffleOutput out;
+    PartitionedShuffleOutput out(mr);
     const size_t parts = shards.empty() ? 0 : shards.front().chains.size();
     out.partitions = parts;
     out.schema = out_schema;
-    out.chains.assign(parts, {});
+    out.chains.resize(parts);
     out.partition_rows.assign(parts, 0);
     for (size_t p = 0; p < parts; ++p)
     {
@@ -148,9 +154,13 @@ PartitionedShuffleOutput shufflePassFromBlockStream(
     const std::vector<size_t> & in_col_index,
     size_t parts,
     uint32_t shift,
-    size_t threads)
+    size_t threads,
+    std::pmr::memory_resource * mr)
 {
-    std::vector<ThreadShard> shards(threads);
+    std::vector<ThreadShard> shards;
+    shards.reserve(threads);
+    for (size_t i = 0; i < threads; ++i)
+        shards.emplace_back(mr);
     for (auto & sh : shards)
         sh.init(parts, out_schema);
 
@@ -161,7 +171,7 @@ PartitionedShuffleOutput shufflePassFromBlockStream(
         {
             const size_t start = (n_blocks * tid) / threads;
             const size_t end = (n_blocks * (tid + 1)) / threads;
-            ScatterScratch scratch;
+            ScatterScratch scratch(mr);
             for (size_t b = start; b < end; ++b)
             {
                 const Block & blk = input.blocks[b];
@@ -171,17 +181,21 @@ PartitionedShuffleOutput shufflePassFromBlockStream(
             }
         });
 
-    return collectChains(std::move(shards), out_schema);
+    return collectChains(shards, out_schema, mr);
 }
 
 
-PartitionedShuffleOutput shufflePassFromChains(const PartitionedShuffleOutput & input, size_t sub_parts, uint32_t shift, size_t threads)
+PartitionedShuffleOutput shufflePassFromChains(
+    const PartitionedShuffleOutput & input, size_t sub_parts, uint32_t shift, size_t threads, std::pmr::memory_resource * mr)
 {
     const size_t in_parts = input.partitions;
     const size_t out_parts = in_parts * sub_parts;
     const size_t n_payload = input.schema.types.size();
 
-    std::vector<ThreadShard> shards(threads);
+    std::vector<ThreadShard> shards;
+    shards.reserve(threads);
+    for (size_t i = 0; i < threads; ++i)
+        shards.emplace_back(mr);
     for (auto & sh : shards)
         sh.init(out_parts, input.schema);
 
@@ -195,7 +209,7 @@ PartitionedShuffleOutput shufflePassFromChains(const PartitionedShuffleOutput & 
         [&](size_t tid)
         {
             ThreadShard & shard = shards[tid];
-            ScatterScratch scratch;
+            ScatterScratch scratch(mr);
             /// Each thread processes a disjoint set of input partitions;
             /// the sub-partition the thread emits encodes as
             /// `ip * sub_parts + s`.
@@ -211,7 +225,7 @@ PartitionedShuffleOutput shufflePassFromChains(const PartitionedShuffleOutput & 
             }
         });
 
-    return collectChains(std::move(shards), input.schema);
+    return collectChains(shards, input.schema, mr);
 }
 
 }
@@ -360,7 +374,11 @@ void scatterBatch(
 
 Block outBlockToBlock(OutBlock && ob)
 {
-    Block b;
+    /// Construct the Block with the same resource as the OutBlock so
+    /// that the buffer transfers below are O(1) same-allocator steals
+    /// rather than copies.
+    auto * mr = ob.keys.get_allocator().resource();
+    Block b(mr);
     b.rows = ob.rows;
     b.keys = std::move(ob.keys);
     b.keys.resize(ob.rows);
@@ -380,7 +398,8 @@ void refineToLeaves(
     const PayloadSchema & schema,
     const std::vector<uint8_t> & pass_bits,
     PartitionOut * leaves_out,
-    ScatterScratch & scratch)
+    ScatterScratch & scratch,
+    std::pmr::memory_resource * mr)
 {
     if (pass_bits.empty())
         throw std::invalid_argument("refineToLeaves: empty pass_bits");
@@ -444,7 +463,7 @@ void refineToLeaves(
     /// straight into `leaves_out`. The final-pass shortcut keeps the
     /// per-leaf chains dense across successive refinements; only the
     /// intermediate passes pay per-refinement allocation cost.
-    std::vector<PartitionOut> cur;
+    std::pmr::vector<PartitionOut> cur(mr);
     cur.emplace_back(std::move(input));
     uint8_t consumed = pass_bits[0];
 
@@ -454,7 +473,8 @@ void refineToLeaves(
         const size_t sub = size_t{1} << bi;
         const uint32_t shift = static_cast<uint32_t>(64u - consumed - bi);
 
-        std::vector<PartitionOut> next(cur.size() * sub);
+        std::pmr::vector<PartitionOut> next(mr);
+        next.resize(cur.size() * sub);
         for (auto & po : next)
             initPartitionOut(po, schema);
 
@@ -507,7 +527,8 @@ PartitionedShuffleOutput radixShuffle(
     const PayloadSchema & out_schema,
     const std::vector<size_t> & in_col_index,
     const RadixConfig & cfg,
-    size_t threads)
+    size_t threads,
+    std::pmr::memory_resource * mr)
 {
     if (cfg.pass_bits.empty())
         throw std::invalid_argument("radixShuffle: at least one pass required");
@@ -520,14 +541,14 @@ PartitionedShuffleOutput radixShuffle(
     uint8_t consumed = 0;
     const uint8_t b0 = cfg.pass_bits[0];
     const uint32_t shift0 = static_cast<uint32_t>(64u - b0);
-    PartitionedShuffleOutput result = shufflePassFromBlockStream(input, out_schema, in_col_index, size_t{1} << b0, shift0, threads);
+    PartitionedShuffleOutput result = shufflePassFromBlockStream(input, out_schema, in_col_index, size_t{1} << b0, shift0, threads, mr);
     consumed = b0;
 
     for (size_t pass = 1; pass < cfg.pass_bits.size(); ++pass)
     {
         const uint8_t bi = cfg.pass_bits[pass];
         const uint32_t shift = static_cast<uint32_t>(64u - consumed - bi);
-        result = shufflePassFromChains(result, size_t{1} << bi, shift, threads);
+        result = shufflePassFromChains(result, size_t{1} << bi, shift, threads, mr);
         consumed = static_cast<uint8_t>(consumed + bi);
     }
 
@@ -535,12 +556,12 @@ PartitionedShuffleOutput radixShuffle(
 }
 
 
-PartitionedShuffleOutput radixShuffle(const BlockStream & input, const RadixConfig & cfg, size_t threads)
+PartitionedShuffleOutput radixShuffle(const BlockStream & input, const RadixConfig & cfg, size_t threads, std::pmr::memory_resource * mr)
 {
     std::vector<size_t> identity(input.schema.types.size());
     for (size_t c = 0; c < identity.size(); ++c)
         identity[c] = c;
-    return radixShuffle(input, input.schema, identity, cfg, threads);
+    return radixShuffle(input, input.schema, identity, cfg, threads, mr);
 }
 
 }

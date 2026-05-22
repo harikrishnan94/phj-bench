@@ -213,7 +213,7 @@ private:
 /// path (CHJ), `JoinHashTable` selects the single-writer path (PHJ).
 /// `hashes` is a worker-owned scratch buffer reused across calls.
 template <class HT>
-void buildOneBlock(Block && block, BlockStore & store, HT & ht, std::vector<uint64_t> & hashes)
+void buildOneBlock(Block && block, BlockStore & store, HT & ht, std::pmr::vector<uint64_t> & hashes)
 {
     const size_t rows = block.rows;
     if (rows == 0)
@@ -249,10 +249,10 @@ void probeOneBlock(
     const BlockStore & build_store,
     const HT & ht,
     ProbeMaterialiser & out,
-    std::vector<uint64_t> & hashes,
-    std::vector<RowRefCell> & heads,
-    std::vector<size_t> & probe_idx,
-    std::vector<RowRefCell> & build_ref)
+    std::pmr::vector<uint64_t> & hashes,
+    std::pmr::vector<RowRefCell> & heads,
+    std::pmr::vector<size_t> & probe_idx,
+    std::pmr::vector<RowRefCell> & build_ref)
 {
     const size_t rows = block.rows;
     if (rows == 0)

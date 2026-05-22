@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <memory_resource>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -13,6 +14,7 @@
 #include "BlockStore.h"
 #include "HashTable.h"
 #include "JoinOps.h"
+#include "MemTracker.h"
 #include "Threading.h"
 #include "Timer.h"
 
@@ -55,25 +57,27 @@ enum class LeafState : uint8_t
 /// `unrefined_rows[p1]` and `leaf_rows[l]` mirror each chain's filled
 /// row count; the eviction argmax reads them directly and byte metrics
 /// are derived from `total_rows * bytes_per_row`.
+///
+/// All internal vectors use the supplied memory resource so that
+/// buffer allocations are tracked by the run's MemTracker.
 struct WorkerProbeState
 {
-    /// Pass-1 chains, indexed by pass-1 partition id `p1 \in [0, P)`.
-    std::vector<PartitionOut> unrefined;
-    std::vector<size_t> unrefined_rows;
+    std::pmr::vector<PartitionOut> unrefined;
+    std::pmr::vector<size_t> unrefined_rows;
+    std::pmr::vector<PartitionOut> leaf;
+    std::pmr::vector<size_t> leaf_rows;
 
-    /// Leaf chains, indexed by global leaf id `l \in [0, total_leaves)`.
-    std::vector<PartitionOut> leaf;
-    std::vector<size_t> leaf_rows;
-
-    /// Running totals (used for both the trigger check and argmax).
     size_t total_rows = 0;
     size_t peak_bytes = 0;
-
-    /// Probe-row byte size: `sizeof(uint64_t)` for the key column plus
-    /// `probe_schema.rowByteSize()`. Counts toward the per-worker
-    /// memory budget M; refinement is row-preserving so we use a row
-    /// count internally and convert to bytes at accounting boundaries.
     size_t bytes_per_row = 0;
+
+    explicit WorkerProbeState(std::pmr::memory_resource * mr)
+        : unrefined(mr)
+        , unrefined_rows(mr)
+        , leaf(mr)
+        , leaf_rows(mr)
+    {
+    }
 };
 
 
@@ -136,6 +140,8 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
     if (threads == 0)
         threads = 1;
 
+    MemTracker tracker;
+
     PhjBepResult result;
     result.output.left_schema = build.schema;
     result.output.right_schema = probe.schema;
@@ -146,7 +152,7 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
 
     /// -------- BUILD SHUFFLE (full leaf depth, same code path as PHJ) --------
     const TimePoint t_bs0 = now();
-    PartitionedShuffleOutput build_part = radixShuffle(build, cfg, threads);
+    PartitionedShuffleOutput build_part = radixShuffle(build, cfg, threads, &tracker);
     const TimePoint t_bs1 = now();
     const uint64_t build_shuffle_ns = toNanos(t_bs1 - t_bs0);
 
@@ -164,14 +170,16 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
         leaf_states[l].store(LeafState::NOT_BUILT, std::memory_order_relaxed);
 
     /// `JoinHashTable` is move-constructible / default-constructible; we
-    /// pre-allocate `total_leaves` empty tables and the CAS-claimed
-    /// constructor populates table `L` in place. `BlockStore` is neither
-    /// movable nor copyable (carries a mutex), so we hold each store via
-    /// `unique_ptr`.
-    std::vector<JoinHashTable> leaf_hts(total_leaves);
+    /// pre-allocate `total_leaves` empty tables using the tracker so that
+    /// the CAS-claimed constructor's cell allocations are tracked.
+    /// `BlockStore` is neither movable nor copyable (carries a mutex), so
+    /// we hold each store via `unique_ptr`; each store is constructed with
+    /// the tracker so its internal data allocations are tracked.
+    std::pmr::vector<JoinHashTable> leaf_hts(&tracker);
+    leaf_hts.resize(total_leaves);
     std::vector<std::unique_ptr<BlockStore>> leaf_stores(total_leaves);
     for (auto & p : leaf_stores)
-        p = std::make_unique<BlockStore>();
+        p = std::make_unique<BlockStore>(&tracker);
 
     /// -------- PER-WORKER TIMING + COUNTERS --------
     std::vector<uint64_t> ns_build(threads, 0);
@@ -188,7 +196,11 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
     /// materialiser must outlive the scatter lambda: the drain reads
     /// every worker's `s.leaf[L]` chains (to merge them per leaf) and
     /// keeps appending output rows through the same materialiser.
-    std::vector<WorkerProbeState> worker_states(threads);
+    std::vector<WorkerProbeState> worker_states;
+    worker_states.reserve(threads);
+    for (size_t i = 0; i < threads; ++i)
+        worker_states.emplace_back(&tracker);
+
     std::vector<ProbeMaterialiser> mats(threads);
 
     /// Drain-phase work-stealing counter. Each leaf is claimed by
@@ -202,22 +214,22 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
         [&](size_t tid)
         {
             WorkerProbeState & s = worker_states[tid];
-            s.unrefined.assign(P, PartitionOut{});
-            s.unrefined_rows.assign(P, 0);
-            s.leaf.assign(total_leaves, PartitionOut{});
-            s.leaf_rows.assign(total_leaves, 0);
+            s.unrefined.resize(P);
+            s.unrefined_rows.resize(P, 0);
+            s.leaf.resize(total_leaves);
+            s.leaf_rows.resize(total_leaves, 0);
             s.bytes_per_row = bytes_per_row;
             for (auto & po : s.unrefined)
                 initPartitionOut(po, probe.schema);
             for (auto & po : s.leaf)
                 initPartitionOut(po, probe.schema);
 
-            ScatterScratch scatter_scratch;
-            std::vector<uint64_t> build_hashes;
-            std::vector<uint64_t> probe_hashes;
-            std::vector<RowRefCell> heads;
-            std::vector<size_t> probe_idx;
-            std::vector<RowRefCell> build_ref;
+            ScatterScratch scatter_scratch(&tracker);
+            std::pmr::vector<uint64_t> build_hashes(&tracker);
+            std::pmr::vector<uint64_t> probe_hashes(&tracker);
+            std::pmr::vector<RowRefCell> heads(&tracker);
+            std::pmr::vector<size_t> probe_idx(&tracker);
+            std::pmr::vector<RowRefCell> build_ref(&tracker);
 
             ProbeMaterialiser & mat = mats[tid];
             mat.init(build.schema, probe.schema, result.output.workers[tid], PIPELINE_BLOCK_ROWS);
@@ -252,7 +264,7 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                 for (size_t i = 0; i < leaves_per_p1; ++i)
                     before[i] = partitionRows(s.leaf[base + i]);
 
-                refineToLeaves(std::move(s.unrefined[p1]), probe.schema, cfg.pass_bits, s.leaf.data() + base, scatter_scratch);
+                refineToLeaves(std::move(s.unrefined[p1]), probe.schema, cfg.pass_bits, s.leaf.data() + base, scatter_scratch, &tracker);
 
                 for (size_t i = 0; i < leaves_per_p1; ++i)
                 {
@@ -487,11 +499,11 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
         threads,
         [&](size_t tid)
         {
-            std::vector<uint64_t> build_hashes;
-            std::vector<uint64_t> probe_hashes;
-            std::vector<RowRefCell> heads;
-            std::vector<size_t> probe_idx;
-            std::vector<RowRefCell> build_ref;
+            std::pmr::vector<uint64_t> build_hashes(&tracker);
+            std::pmr::vector<uint64_t> probe_hashes(&tracker);
+            std::pmr::vector<RowRefCell> heads(&tracker);
+            std::pmr::vector<size_t> probe_idx(&tracker);
+            std::pmr::vector<RowRefCell> build_ref(&tracker);
 
             ProbeMaterialiser & mat = mats[tid];
 
@@ -532,7 +544,7 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                 /// `probe_shuffle` since it's the analogue of PHJ's
                 /// probe-side shuffle for this leaf.
                 const TimePoint tm0 = now();
-                PartitionOut merged;
+                PartitionOut merged(&tracker);
                 size_t merged_rows = 0;
                 for (size_t t = 0; t < threads; ++t)
                 {
@@ -679,6 +691,8 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
         result.bep_build_skip_retries += worker_skip_retries[t];
         result.bep_peak_bytes = std::max(result.bep_peak_bytes, worker_peak_bytes[t]);
     }
+
+    result.peak_mem_bytes = tracker.peakBytes();
 
     return result;
 }

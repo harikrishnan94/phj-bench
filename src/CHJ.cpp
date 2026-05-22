@@ -4,6 +4,7 @@
 
 #include "BlockStore.h"
 #include "JoinOps.h"
+#include "MemTracker.h"
 #include "Threading.h"
 #include "Timer.h"
 #include "TwoLevelHashTable.h"
@@ -17,14 +18,16 @@ ChjResult runCHJ(const BlockStream & build, const BlockStream & probe, size_t th
     if (threads == 0)
         threads = 1;
 
+    MemTracker tracker;
+
     ChjResult result;
     result.output.left_schema = build.schema;
     result.output.right_schema = probe.schema;
     result.output.workers.resize(threads);
 
-    BlockStore store;
+    BlockStore store(&tracker);
     store.reserveBlocks(build.blocks.size());
-    TwoLevelJoinHashTable ht;
+    TwoLevelJoinHashTable ht(&tracker);
 
     std::vector<uint64_t> build_ns(threads, 0);
     std::vector<uint64_t> probe_ns(threads, 0);
@@ -42,17 +45,13 @@ ChjResult runCHJ(const BlockStream & build, const BlockStream & probe, size_t th
             const size_t n = build.blocks.size();
             const size_t start = (n * tid) / threads;
             const size_t end = (n * (tid + 1)) / threads;
-            std::vector<uint64_t> hashes;
+            std::pmr::vector<uint64_t> hashes(&tracker);
             for (size_t b = start; b < end; ++b)
             {
-                /// We need a mutable copy to move into the store. The
-                /// underlying source `build.blocks` stays intact across
-                /// reps (and across the optional --check pass), so we
-                /// deep-copy at block granularity here. This is the
-                /// "append the block to the build-side block store"
-                /// step in the spec; the build store ultimately owns
-                /// the block's storage.
-                Block clone = build.blocks[b];
+                /// Deep-copy the input block through the tracker so its
+                /// key and payload storage is accounted for. The input
+                /// `build.blocks[b]` remains intact for subsequent reps.
+                Block clone(build.blocks[b], &tracker);
                 buildOneBlock(std::move(clone), store, ht, hashes);
             }
             build_ns[tid] = toNanos(now() - t0);
@@ -75,10 +74,10 @@ ChjResult runCHJ(const BlockStream & build, const BlockStream & probe, size_t th
             ProbeMaterialiser mat;
             mat.init(build.schema, probe.schema, result.output.workers[tid], PIPELINE_BLOCK_ROWS);
 
-            std::vector<uint64_t> hashes;
-            std::vector<RowRefCell> heads;
-            std::vector<size_t> probe_idx;
-            std::vector<RowRefCell> build_ref;
+            std::pmr::vector<uint64_t> hashes(&tracker);
+            std::pmr::vector<RowRefCell> heads(&tracker);
+            std::pmr::vector<size_t> probe_idx(&tracker);
+            std::pmr::vector<RowRefCell> build_ref(&tracker);
 
             for (size_t b = start; b < end; ++b)
                 probeOneBlock(probe.blocks[b].view(), store, ht, mat, hashes, heads, probe_idx, build_ref);
@@ -102,6 +101,7 @@ ChjResult runCHJ(const BlockStream & build, const BlockStream & probe, size_t th
     result.probe.wall_ms = toMillis(t_probe1 - t_probe0);
     result.probe.ns_per_row = probe.total_rows == 0 ? 0.0 : static_cast<double>(sum_probe_ns) / static_cast<double>(probe.total_rows);
     result.e2e_wall_ms = toMillis(t_e2e1 - t_e2e0);
+    result.peak_mem_bytes = tracker.peakBytes();
 
     return result;
 }

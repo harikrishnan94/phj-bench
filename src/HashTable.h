@@ -3,6 +3,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <memory_resource>
 #include <vector>
 
 #include "Hash.h"
@@ -18,9 +19,15 @@ namespace phj
 /// the HT records only the head `RowRefCell` per key. Resize uses
 /// `intHash64(key)` to recompute positions; both join schemes use the
 /// same hash unchanged so this is well-defined.
+///
+/// JoinHashTable is allocator-aware (allocator_type =
+/// polymorphic_allocator<>) so that pmr containers of hash tables
+/// (e.g., the per-leaf HT vector in PHJBep) propagate their resource
+/// into each table's cell array at construction time.
 class JoinHashTable
 {
 public:
+    using allocator_type = std::pmr::polymorphic_allocator<>;
     using Hash = uint64_t;
     using Key = uint64_t;
     using Ref = RowRefCell;
@@ -32,7 +39,28 @@ public:
     };
     static_assert(sizeof(Cell) == 16);
 
-    JoinHashTable() = default;
+    JoinHashTable()
+        : cells(std::pmr::get_default_resource())
+    {
+    }
+    explicit JoinHashTable(std::pmr::memory_resource * mr)
+        : cells(mr)
+    {
+    }
+
+    /// Allocator-extended constructors used by pmr containers.
+    JoinHashTable(std::allocator_arg_t, allocator_type const & alloc)
+        : cells(alloc)
+    {
+    }
+
+    JoinHashTable(JoinHashTable && o, allocator_type const & alloc)
+        : cells(std::move(o.cells), alloc)
+        , num_cells(o.num_cells)
+    {
+        o.num_cells = 0;
+    }
+
     JoinHashTable(const JoinHashTable &) = delete;
     JoinHashTable & operator=(const JoinHashTable &) = delete;
     JoinHashTable(JoinHashTable &&) noexcept = default;
@@ -112,14 +140,14 @@ public:
 private:
     static constexpr size_t DEFAULT_CAPACITY = 128 * 1024;
 
-    std::vector<Cell> cells;
+    std::pmr::vector<Cell> cells;
     size_t num_cells = 0;
 
     void ensureCapacity(size_t new_cap)
     {
         if (new_cap <= cells.size())
             return;
-        std::vector<Cell> old_cells = std::move(cells);
+        std::pmr::vector<Cell> old_cells = std::move(cells);
         cells.assign(new_cap, Cell{0, INVALID_REF});
         num_cells = 0;
         const size_t new_mask = new_cap - 1;

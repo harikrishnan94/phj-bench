@@ -14,6 +14,7 @@ struct ChjResult
     PhaseTiming build;
     PhaseTiming probe;
     double e2e_wall_ms = 0.0;
+    size_t peak_mem_bytes = 0;
     JoinOutput output;
 };
 
