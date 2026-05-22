@@ -51,9 +51,9 @@ int main(int argc, char ** argv)
     std::vector<PhjResult> phj_reps;
     std::vector<PhjBepResult> bep_reps;
 
-    const bool run_chj = opts.scheme == SchemeChoice::CHJ || opts.scheme == SchemeChoice::All;
-    const bool run_phj = opts.scheme == SchemeChoice::PHJ || opts.scheme == SchemeChoice::All;
-    const bool run_bep = opts.scheme == SchemeChoice::PhjBep || opts.scheme == SchemeChoice::All;
+    const bool run_chj = opts.scheme == SchemeChoice::CHJ || opts.scheme == SchemeChoice::All || opts.scheme == SchemeChoice::Default;
+    const bool run_phj_pure = opts.scheme == SchemeChoice::PhjPure || opts.scheme == SchemeChoice::All;
+    const bool run_phj = opts.scheme == SchemeChoice::PHJ || opts.scheme == SchemeChoice::All || opts.scheme == SchemeChoice::Default;
 
     if (run_chj)
     {
@@ -67,30 +67,30 @@ int main(int argc, char ** argv)
         }
     }
 
-    if (run_phj)
+    if (run_phj_pure)
     {
         phj_reps.reserve(opts.reps);
         for (size_t r = 0; r < opts.reps; ++r)
         {
             PhjResult res = runPHJ(build, probe, opts.radix, opts.threads);
-            std::cerr << "[info] PHJ rep " << r << ": shuffle " << res.build_shuffle.wall_ms << "/" << res.probe_shuffle.wall_ms
+            std::cerr << "[info] PHJ-PURE rep " << r << ": shuffle " << res.build_shuffle.wall_ms << "/" << res.probe_shuffle.wall_ms
                       << " ms, build " << res.build.wall_ms << " ms, probe " << res.probe.wall_ms << " ms, e2e " << res.e2e_wall_ms
                       << " ms, out_rows " << res.output.totalRows() << "\n";
             phj_reps.push_back(std::move(res));
         }
     }
 
-    if (run_bep)
+    if (run_phj)
     {
         bep_reps.reserve(opts.reps);
         for (size_t r = 0; r < opts.reps; ++r)
         {
             PhjBepResult res = runPhjBep(build, probe, opts.radix, opts.threads, opts.bep_budget_mib);
-            std::cerr << "[info] PHJ-BEP rep " << r << ": shuffle(build) " << res.build_shuffle.wall_ms << " ms, build "
-                      << res.build.wall_ms << " ms, shuffle(probe) " << res.probe_shuffle.wall_ms << " ms, probe " << res.probe.wall_ms
-                      << " ms, evict " << res.eviction_overhead.wall_ms << " ms, e2e " << res.e2e_wall_ms << " ms, out_rows "
-                      << res.output.totalRows() << ", budget " << res.bep_budget_mib << " MiB, evictions " << res.bep_evictions
-                      << ", refinements " << res.bep_refinements << ", peak " << res.bep_peak_buffered_rows << " rows, skip-retries "
+            std::cerr << "[info] PHJ rep " << r << ": shuffle(build) " << res.build_shuffle.wall_ms << " ms, build " << res.build.wall_ms
+                      << " ms, shuffle(probe) " << res.probe_shuffle.wall_ms << " ms, probe " << res.probe.wall_ms << " ms, evict "
+                      << res.eviction_overhead.wall_ms << " ms, e2e " << res.e2e_wall_ms << " ms, out_rows " << res.output.totalRows()
+                      << ", budget " << res.bep_budget_mib << " MiB, evictions " << res.bep_evictions << ", refinements "
+                      << res.bep_refinements << ", peak " << res.bep_peak_buffered_rows << " rows, skip-retries "
                       << res.bep_build_skip_retries << "\n";
             bep_reps.push_back(std::move(res));
         }
@@ -113,9 +113,22 @@ int main(int argc, char ** argv)
                 std::cerr << "[check] CHJ OK (" << reference.size() << " rows)\n";
             }
         }
-        if (run_phj && !phj_reps.empty())
+        if (run_phj_pure && !phj_reps.empty())
         {
             auto err = compareOutputs(reference, serializeOutput(phj_reps.front().output));
+            if (!err.empty())
+            {
+                std::cerr << "[check] PHJ-PURE FAILED: " << err << "\n";
+                rc = 1;
+            }
+            else
+            {
+                std::cerr << "[check] PHJ-PURE OK (" << reference.size() << " rows)\n";
+            }
+        }
+        if (run_phj && !bep_reps.empty())
+        {
+            auto err = compareOutputs(reference, serializeOutput(bep_reps.front().output));
             if (!err.empty())
             {
                 std::cerr << "[check] PHJ FAILED: " << err << "\n";
@@ -124,19 +137,6 @@ int main(int argc, char ** argv)
             else
             {
                 std::cerr << "[check] PHJ OK (" << reference.size() << " rows)\n";
-            }
-        }
-        if (run_bep && !bep_reps.empty())
-        {
-            auto err = compareOutputs(reference, serializeOutput(bep_reps.front().output));
-            if (!err.empty())
-            {
-                std::cerr << "[check] PHJ-BEP FAILED: " << err << "\n";
-                rc = 1;
-            }
-            else
-            {
-                std::cerr << "[check] PHJ-BEP OK (" << reference.size() << " rows)\n";
             }
         }
         if (rc != 0)

@@ -475,8 +475,8 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
     ///      shared HT, with build and probe staying on the same worker
     ///      for any leaf that was lazy-built in step 3 (HT-hot cache,
     ///      matching PHJ). For leaves whose HT was already built mid-
-    ///      stream the worker pays the same cold-HT cost PHJ-BEP has
-    ///      always paid for those leaves.
+    ///      stream the worker pays the same cold-HT cost this BEP path
+    ///      has always paid for those leaves.
     parallelRun(
         threads,
         [&](size_t tid)

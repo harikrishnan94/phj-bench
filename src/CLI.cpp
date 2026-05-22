@@ -14,13 +14,14 @@ namespace phj
 namespace
 {
 
-const char * USAGE = R"(phj-bench: hash join benchmark (CHJ vs PHJ vs PHJ-BEP)
+const char * USAGE = R"(phj-bench: hash join benchmark (CHJ vs PHJ vs PHJ-PURE)
 
 Usage:
   phj-bench [options]
 
 Options:
-  --scheme {chj|phj|phj-bep|all} Which scheme(s) to run (default: all).
+  --scheme {chj|phj|phj-pure|all} Which scheme(s) to run
+                                (default: chj,phj; all includes phj-pure).
   --build-rows N                 Number of build-side rows (default: 1000000).
   --probe-rows N                 Number of probe-side rows (default: 1000000).
   --build-payload-schema LIST    Comma-separated payload types, e.g. u32,u64,u128.
@@ -32,7 +33,7 @@ Options:
   --partition-bits-per-pass LIST Comma-separated bits-per-pass list (overrides
                                  --partitions and --passes). Example: 6,4 ->
                                  1024 partitions in two passes.
-  --bep-budget-mib N             PHJ-BEP per-worker probe buffer budget in MiB
+  --bep-budget-mib N             PHJ per-worker probe buffer budget in MiB
                                  (default: 32). Only probe input buffer bytes
                                  (unrefined and leaf chains) count toward it.
   --reps N                       Repetitions per scheme (default: 1).
@@ -187,9 +188,9 @@ std::optional<Options> parseCli(int argc, char ** argv, bool * ok)
             {
                 opts.scheme = SchemeChoice::PHJ;
             }
-            else if (value == "phj-bep")
+            else if (value == "phj-pure")
             {
-                opts.scheme = SchemeChoice::PhjBep;
+                opts.scheme = SchemeChoice::PhjPure;
             }
             else if (value == "all")
             {
@@ -197,7 +198,7 @@ std::optional<Options> parseCli(int argc, char ** argv, bool * ok)
             }
             else
             {
-                std::cerr << "--scheme must be chj|phj|phj-bep|all\n";
+                std::cerr << "--scheme must be chj|phj|phj-pure|all\n";
                 *ok = false;
                 return std::nullopt;
             }

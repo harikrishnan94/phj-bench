@@ -305,14 +305,14 @@ void printSummary(
     {
         Stats e2e;
         auto rows = phjRows(phj_reps, e2e);
-        printSchemeTable(os, "PHJ", rows, e2e);
+        printSchemeTable(os, "PHJ-PURE", rows, e2e);
     }
     if (!bep_reps.empty())
     {
         Stats e2e;
         BepFooter footer;
         auto rows = bepRows(bep_reps, e2e, footer);
-        printSchemeTable(os, "PHJ-BEP", rows, e2e, footer);
+        printSchemeTable(os, "PHJ", rows, e2e, footer);
     }
 }
 
@@ -333,11 +333,11 @@ void writeCsv(
         /// Columns in order:
         ///   - common metadata
         ///   - build/probe phases (shared across all three schemes)
-        ///   - build_shuffle/probe_shuffle phases (PHJ + PHJ-BEP only;
+        ///   - build_shuffle/probe_shuffle phases (PHJ-PURE + PHJ only;
         ///     blank for CHJ)
-        ///   - eviction_overhead phase (PHJ-BEP only)
+        ///   - eviction_overhead phase (PHJ only)
         ///   - e2e
-        ///   - BEP-only per-run metrics (PHJ-BEP only)
+        ///   - BEP-only per-run metrics (PHJ only)
         f << "scheme,rep,threads,build_rows,probe_rows,build_payload_schema,probe_payload_schema,partitions,distribution,match_rate,"
              "build_wall_ms,build_ns_per_row,probe_wall_ms,probe_ns_per_row,"
              "build_shuffle_wall_ms,build_shuffle_ns_per_row,probe_shuffle_wall_ms,probe_shuffle_ns_per_row,"
@@ -392,7 +392,7 @@ void writeCsv(
     for (size_t i = 0; i < phj_reps.size(); ++i)
     {
         const auto & r = phj_reps[i];
-        writeCommon("PHJ", i);
+        writeCommon("PHJ-PURE", i);
         emit(r.build.wall_ms);
         emit(r.build.ns_per_row);
         emit(r.probe.wall_ms);
@@ -414,7 +414,7 @@ void writeCsv(
     for (size_t i = 0; i < bep_reps.size(); ++i)
     {
         const auto & r = bep_reps[i];
-        writeCommon("PHJ-BEP", i);
+        writeCommon("PHJ", i);
         emit(r.build.wall_ms);
         emit(r.build.ns_per_row);
         emit(r.probe.wall_ms);

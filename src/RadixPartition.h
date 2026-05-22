@@ -106,7 +106,7 @@ PartitionedShuffleOutput radixShuffle(const BlockStream & input, const RadixConf
 /// against a per-(thread, partition) `PartitionOut` chain. The
 /// pieces below expose that machinery for callers that drive the
 /// scatter outside of the full `radixShuffle` orchestrator — in
-/// particular PHJ-BEP, which runs the first pass on incoming
+/// particular the BEP-backed PHJ path, which runs the first pass on incoming
 /// probe blocks and the trailing passes on a single already-
 /// buffered partition under a memory-budget eviction loop.
 /// ============================================================

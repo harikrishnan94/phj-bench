@@ -14,7 +14,7 @@ namespace phj
 {
 
 /// Pretty-print one run's results (per scheme: median/min/max across reps
-/// for each phase metric). The PHJ-BEP table additionally contains an
+/// for each phase metric). The BEP-backed PHJ table additionally contains an
 /// `eviction-overhead` phase row and a footer with the BEP per-run
 /// metrics (budget, evictions, refinements, peak buffered rows, build
 /// skip retries).
@@ -27,8 +27,8 @@ void printSummary(
 
 
 /// Write one CSV row per `(scheme, rep)`. Header is emitted iff the
-/// file does not already exist. CHJ rows leave the PHJ-only phases and
-/// BEP-only columns blank; PHJ rows leave the BEP-only columns blank.
+/// file does not already exist. CHJ rows leave the partitioned phases and
+/// BEP-only columns blank; PHJ-PURE rows leave the BEP-only columns blank.
 void writeCsv(
     const std::string & path,
     const Options & opts,
