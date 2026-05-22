@@ -40,20 +40,38 @@ struct PhjBepResult
 /// (lazy build under a `NOT_BUILT` -> `BUILDING` -> `BUILT` state
 /// machine, at most one construction per leaf across the whole run).
 ///
-/// Probe phase: per-thread, single-pass over that worker's slice of
-/// probe input. Each incoming block is scattered through pass 1 only
-/// (top `pass_bits[0]` bits) into per-worker unrefined chains. After
-/// each input block, if total per-worker buffered bytes >= `M_bytes`,
-/// the eviction loop fires: pick the largest buffered partition; if
-/// unrefined, force-refine it through passes 2..N (cascading to leaves)
-/// and re-select; if a leaf, `ensure_built` + `process_partition` +
-/// drop. Eviction selection skips `BUILDING` leaves; if all eligible
-/// candidates are mid-build, brief backoff and re-check. At end of
-/// input, the remaining non-empty partitions are drained.
+/// Probe phase, in three subphases:
+///
+///   1. Per-worker scatter + mid-stream eviction (parallelRun #1).
+///      Each worker processes its slice of probe input. Each incoming
+///      block is scattered through pass 1 only (top `pass_bits[0]`
+///      bits) into per-worker unrefined chains. After each input block,
+///      if total per-worker buffered bytes >= `M_bytes`, the eviction
+///      loop fires: pick the largest buffered partition; if unrefined,
+///      force-refine it through passes 2..N (cascading to leaves) and
+///      re-select; if a leaf, `ensure_built` + `process_partition` +
+///      drop. Eviction selection skips `BUILDING` leaves; if all
+///      eligible candidates are mid-build, brief backoff and re-check.
+///      At end of input each worker refines its remaining unrefined
+///      pass-1 buckets into its own per-leaf chains, then exits.
+///
+///   2. Work-stealing drain (parallelRun #2). Each leaf is claimed by
+///      exactly one worker via a shared `fetch_add`. The claiming
+///      worker lazily cross-merges that leaf's per-worker chains into
+///      a single chain (moves only), then — if mid-stream eviction
+///      never built the leaf's HT — builds it now and probes the
+///      merged chain end-to-end. This restores PHJ's single-owner-
+///      per-partition build+probe semantics for everything that
+///      survived mid-stream eviction: at large budgets where no leaf
+///      is ever evicted mid-stream, the drain is structurally
+///      equivalent to PHJ's post-shuffle build+probe loop.
 ///
 /// `bep_budget_mib` is the per-worker memory budget in mebibytes; only
 /// probe input buffer bytes (across both unrefined and leaf chains)
-/// count toward it.
+/// count toward it. With a budget large enough to hold each worker's
+/// entire probe slice, the mid-stream eviction loop never fires and
+/// the drain reduces to PHJ's build+probe loop modulo the cross-worker
+/// merge (which is move-only, no data copies).
 PhjBepResult
 runPhjBep(const BlockStream & build, const BlockStream & probe, const RadixConfig & cfg, size_t threads, size_t bep_budget_mib);
 

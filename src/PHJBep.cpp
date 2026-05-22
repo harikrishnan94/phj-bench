@@ -177,12 +177,25 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
     std::vector<size_t> worker_peak_rows(threads, 0);
     std::vector<size_t> worker_skip_retries(threads, 0);
 
+    /// Hoisted per-worker state. The work-stealing drain below runs in
+    /// a second `parallelRun`, so the worker buffers and the per-thread
+    /// materialiser must outlive the scatter lambda: the drain reads
+    /// every worker's `s.leaf[L]` chains (to merge them per leaf) and
+    /// keeps appending output rows through the same materialiser.
+    std::vector<WorkerProbeState> worker_states(threads);
+    std::vector<ProbeMaterialiser> mats(threads);
+
+    /// Drain-phase work-stealing counter. Each leaf is claimed by
+    /// exactly one worker via `fetch_add`, restoring PHJ's single-
+    /// owner-per-partition build+probe semantics for the drain.
+    std::atomic<size_t> next_drain_leaf{0};
+
     /// -------- PER-THREAD PROBE LOOP --------
     parallelRun(
         threads,
         [&](size_t tid)
         {
-            WorkerProbeState s;
+            WorkerProbeState & s = worker_states[tid];
             s.unrefined.assign(P, PartitionOut{});
             s.unrefined_rows.assign(P, 0);
             s.leaf.assign(total_leaves, PartitionOut{});
@@ -200,7 +213,7 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
             std::vector<size_t> probe_idx;
             std::vector<RowRefCell> build_ref;
 
-            ProbeMaterialiser mat;
+            ProbeMaterialiser & mat = mats[tid];
             mat.init(build.schema, probe.schema, result.output.workers[tid], PIPELINE_BLOCK_ROWS);
 
             uint64_t my_build_ns = 0;
@@ -419,112 +432,13 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                 ++my_refinements;
             }
 
-            /// Process every leaf that still has rows. Two structural
-            /// tricks avoid the obvious thundering herd that arises
-            /// when every worker iterates leaves in the same order
-            /// and serialises on the leaf currently mid-build:
-            ///
-            ///   - Each worker starts at a different offset across the
-            ///     leaf range (`(tid * total_leaves) / threads`). With
-            ///     16 workers and 2048 leaves, worker 0 starts at leaf
-            ///     0, worker 1 at 128, worker 15 at 1920. The CAS-claim
-            ///     race that builds each leaf's HT spreads across the
-            ///     leaf space rather than serialising on leaf 0.
-            ///
-            ///   - When a worker hits a leaf currently in `BUILDING`,
-            ///     it defers that leaf to a per-worker pending list
-            ///     instead of blocking. After one offset-stepped pass
-            ///     the pending list is drained with brief backoff
-            ///     between sweeps. In practice the offset trick lets
-            ///     each worker walk through its own region while the
-            ///     other workers complete their assigned leaves, so
-            ///     the pending list is empty by the time we get to
-            ///     the backoff loop.
-            const size_t drain_offset = threads == 0 ? 0 : (tid * total_leaves) / threads;
-            std::vector<size_t> pending;
-
-            auto ensureBuiltOrDefer = [&](size_t leaf) -> bool
-            {
-                /// Returns true if `leaf` is BUILT (caller processes
-                /// now). Returns false if BUILDING or the CAS-claim
-                /// was lost (defer for the second pass).
-                const TimePoint ts0 = now();
-                LeafState st = leaf_states[leaf].load(std::memory_order_acquire);
-                if (st == LeafState::BUILT)
-                {
-                    my_eviction_ns += toNanos(now() - ts0);
-                    return true;
-                }
-                if (st == LeafState::BUILDING)
-                {
-                    ++my_skip_retries;
-                    my_eviction_ns += toNanos(now() - ts0);
-                    return false;
-                }
-                LeafState expected = LeafState::NOT_BUILT;
-                const bool claimed = leaf_states[leaf].compare_exchange_strong(expected, LeafState::BUILDING, std::memory_order_acq_rel);
-                my_eviction_ns += toNanos(now() - ts0);
-                if (claimed)
-                {
-                    const TimePoint tb0 = now();
-                    buildLeafHt(leaf);
-                    leaf_states[leaf].store(LeafState::BUILT, std::memory_order_release);
-                    my_build_ns += toNanos(now() - tb0);
-                    return true;
-                }
-                /// Lost the CAS — another worker is now the constructor.
-                ++my_skip_retries;
-                return false;
-            };
-
-            auto processAndDrop = [&](size_t leaf)
-            {
-                const TimePoint tp0 = now();
-                processPartition(leaf);
-                my_probe_ns += toNanos(now() - tp0);
-                const TimePoint td0 = now();
-                dropLeafProbeBuffers(leaf);
-                my_eviction_ns += toNanos(now() - td0);
-                ++my_evictions;
-            };
-
-            /// Pass 1: walk the leaves once at the chosen offset.
-            /// Process whatever is BUILT, defer in-flight builds.
-            for (size_t i = 0; i < total_leaves; ++i)
-            {
-                const size_t l = (drain_offset + i) % total_leaves;
-                if (s.leaf_rows[l] == 0)
-                    continue;
-                if (ensureBuiltOrDefer(l))
-                    processAndDrop(l);
-                else
-                    pending.push_back(l);
-            }
-
-            /// Pass 2: drain the deferred leaves with brief backoff.
-            /// Each sweep is O(|pending|), shrinking as builds complete.
-            while (!pending.empty())
-            {
-                std::vector<size_t> still_pending;
-                still_pending.reserve(pending.size());
-                for (size_t l : pending)
-                {
-                    if (ensureBuiltOrDefer(l))
-                        processAndDrop(l);
-                    else
-                        still_pending.push_back(l);
-                }
-                pending.swap(still_pending);
-                if (pending.empty())
-                    break;
-                /// The sleep counts toward `eviction_overhead_ns`.
-                const TimePoint tb0 = now();
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
-                my_eviction_ns += toNanos(now() - tb0);
-            }
-
-            mat.finish();
-
+            /// End of parallelRun #1. The old per-worker leaf drain
+            /// (offset-stepped walk with CAS-claimed builds and a
+            /// pending/backoff loop) has been replaced by the second
+            /// parallelRun below, which restores PHJ's single-owner-
+            /// per-partition build+probe by work-stealing leaves and
+            /// merging the per-worker `s.leaf[L]` chains lazily under
+            /// fetch_add-exclusive ownership.
             ns_build[tid] = my_build_ns;
             ns_probe_shuffle[tid] = my_probe_shuffle_ns;
             ns_probe[tid] = my_probe_ns;
@@ -533,6 +447,176 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
             worker_refinements[tid] = my_refinements;
             worker_peak_rows[tid] = s.peak_rows;
             worker_skip_retries[tid] = my_skip_retries;
+        });
+
+    /// -------- WORK-STEALING DRAIN (PHJ-EQUIVALENT) --------
+    /// Mid-stream eviction has already processed (and dropped) the
+    /// slices it was forced to flush; whatever remains lives in each
+    /// worker's `s.leaf[L]` chains. We now drain that residual exactly
+    /// like PHJ drains its post-shuffle partitions:
+    ///
+    ///   1. A shared atomic `next_drain_leaf` work-steals leaves. Each
+    ///      successful `fetch_add` gives the calling worker exclusive
+    ///      ownership of leaf L for the drain phase — no other worker
+    ///      will read `worker_states[*].leaf[L]` once this one starts.
+    ///
+    ///   2. The worker lazily cross-merges leaf L by walking every
+    ///      `worker_states[t].leaf[L]` and moving its OutBlocks into a
+    ///      local chain. Since the merge moves blocks (no copies) and
+    ///      the per-worker chains are unobserved by anyone else, no
+    ///      synchronisation is required.
+    ///
+    ///   3. If mid-stream eviction never built leaf L's HT, the
+    ///      claiming worker builds it now. The fetch_add already
+    ///      guarantees uniqueness, so the CAS dance from the old drain
+    ///      collapses to a plain store of `BUILT`.
+    ///
+    ///   4. The merged chain is probed end-to-end against the leaf's
+    ///      shared HT, with build and probe staying on the same worker
+    ///      for any leaf that was lazy-built in step 3 (HT-hot cache,
+    ///      matching PHJ). For leaves whose HT was already built mid-
+    ///      stream the worker pays the same cold-HT cost PHJ-BEP has
+    ///      always paid for those leaves.
+    parallelRun(
+        threads,
+        [&](size_t tid)
+        {
+            std::vector<uint64_t> build_hashes;
+            std::vector<uint64_t> probe_hashes;
+            std::vector<RowRefCell> heads;
+            std::vector<size_t> probe_idx;
+            std::vector<RowRefCell> build_ref;
+
+            ProbeMaterialiser & mat = mats[tid];
+
+            uint64_t my_build_ns = 0;
+            uint64_t my_probe_ns = 0;
+            uint64_t my_probe_shuffle_ns = 0;
+            uint64_t my_eviction_ns = 0;
+            size_t my_evictions = 0;
+
+            /// Re-declared here (rather than hoisted as a free function)
+            /// so each drain worker has its own scratch hashes vector
+            /// captured by reference.
+            auto buildLeafHt = [&](size_t leaf)
+            {
+                BlockStore & store = *leaf_stores[leaf];
+                store.reserveBlocks(build_part.chains[leaf].blocks.size());
+                JoinHashTable & ht = leaf_hts[leaf];
+                if (build_part.partition_rows[leaf] > 0)
+                    ht.reserve(build_part.partition_rows[leaf]);
+                for (auto & ob : build_part.chains[leaf].blocks)
+                {
+                    Block as_block = outBlockToBlock(std::move(ob));
+                    buildOneBlock(std::move(as_block), store, ht, build_hashes);
+                }
+                build_part.chains[leaf].blocks.clear();
+            };
+
+            while (true)
+            {
+                const size_t L = next_drain_leaf.fetch_add(1, std::memory_order_relaxed);
+                if (L >= total_leaves)
+                    break;
+
+                /// Lazy cross-worker merge for leaf L. fetch_add gave
+                /// us exclusive ownership of `worker_states[*].leaf[L]`
+                /// for the drain phase, so the moves below need no
+                /// synchronisation. The merge time is attributed to
+                /// `probe_shuffle` since it's the analogue of PHJ's
+                /// probe-side shuffle for this leaf.
+                const TimePoint tm0 = now();
+                PartitionOut merged;
+                size_t merged_rows = 0;
+                for (size_t t = 0; t < threads; ++t)
+                {
+                    auto & src = worker_states[t].leaf[L];
+                    for (auto & blk : src.blocks)
+                    {
+                        if (blk.rows > 0)
+                        {
+                            merged_rows += blk.rows;
+                            merged.blocks.push_back(std::move(blk));
+                        }
+                    }
+                    src.blocks.clear();
+                    src.cur = nullptr;
+                }
+                my_probe_shuffle_ns += toNanos(now() - tm0);
+
+                if (merged_rows == 0)
+                {
+                    /// No residual probe rows for this leaf — either
+                    /// it was empty all along (build had no rows
+                    /// either) or mid-stream eviction already processed
+                    /// every worker's slice. Either way, the HT and
+                    /// store are no longer needed; release them so the
+                    /// drain doesn't keep up to `total_leaves` HTs
+                    /// alive simultaneously.
+                    leaf_hts[L] = JoinHashTable{};
+                    leaf_stores[L].reset();
+                    continue;
+                }
+
+                /// Acquire-load tracks whether mid-stream eviction
+                /// already built this leaf's HT (it may have done so on
+                /// another worker, in which case we just probe). The
+                /// fetch_add above plus the parallelRun #1 join provides
+                /// the necessary happens-before so no CAS-claim is
+                /// required to write `BUILT`.
+                if (leaf_states[L].load(std::memory_order_acquire) == LeafState::NOT_BUILT)
+                {
+                    const TimePoint tb0 = now();
+                    buildLeafHt(L);
+                    leaf_states[L].store(LeafState::BUILT, std::memory_order_release);
+                    my_build_ns += toNanos(now() - tb0);
+                }
+
+                /// Probe the merged chain end-to-end. For leaves we
+                /// just built, HT + BlockStore are hot in this worker's
+                /// cache (PHJ-equivalent behaviour); for leaves built
+                /// mid-stream by another worker they arrive cold.
+                const TimePoint tp0 = now();
+                const JoinHashTable & ht = leaf_hts[L];
+                const BlockStore & store = *leaf_stores[L];
+                for (const auto & ob : merged.blocks)
+                {
+                    if (ob.rows == 0)
+                        continue;
+                    probeOneBlock(ob.view(), store, ht, mat, probe_hashes, heads, probe_idx, build_ref);
+                }
+                my_probe_ns += toNanos(now() - tp0);
+
+                /// Releasing the merged chain destroys its OutBlocks
+                /// (and their keys/payload vectors). We also free the
+                /// leaf's HT and build-side store now that the drain
+                /// is done with them: `ProbeMaterialiser` has already
+                /// copied every matched build payload by value into
+                /// the output blocks, so no dangling reference remains.
+                /// This matches PHJ's stack-local HT lifetime — only
+                /// the leaves currently in flight occupy memory,
+                /// rather than 2048 simultaneously-allocated HTs
+                /// piling up heap fragmentation across the drain.
+                /// Counted as eviction overhead to match the old
+                /// drain's accounting of `dropLeafProbeBuffers` calls.
+                const TimePoint td0 = now();
+                dropPartition(merged);
+                leaf_hts[L] = JoinHashTable{};
+                leaf_stores[L].reset();
+                my_eviction_ns += toNanos(now() - td0);
+                ++my_evictions;
+            }
+
+            mat.finish();
+
+            /// The drain runs after parallelRun #1 has already written
+            /// the mid-stream tallies; accumulate the drain's per-
+            /// thread totals on top.
+            ns_build[tid] += my_build_ns;
+            ns_probe_shuffle[tid] += my_probe_shuffle_ns;
+            ns_probe[tid] += my_probe_ns;
+            ns_eviction[tid] += my_eviction_ns;
+            worker_evictions[tid] += my_evictions;
         });
 
     const TimePoint t_e2e1 = now();
