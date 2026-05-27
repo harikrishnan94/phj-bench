@@ -66,67 +66,49 @@ struct BlockPartitioning
 };
 
 
-/// Probe a subset of rows from one buffered probe block against one
-/// leaf's pre-built HT. `sel_idx` are the row indices to probe, all
-/// pointing into `probe_block`; `precomputed_hashes` is the worker's
-/// per-block hash array (so we don't re-hash). The materialiser's
-/// existing `gatherFromProbeBlock` is reused unchanged — it accepts
-/// a `probe_idx` array that holds original block-row indices, which
-/// is exactly what `sel_idx` provides.
-///
-/// This is the kernel of Idea 2: no physical scatter, only a selection
-/// vector. We pay one (key, hash) gather per row at probe time and one
-/// payload gather per output row at materialise time; both reads
-/// originate from the original buffered block (which sits in the
-/// thread-local working set).
-template <class HT>
-[[gnu::always_inline]] inline void probeSubsetOfBuffered(
-    BlockView probe_block,
-    const uint32_t * sel_idx,
-    size_t n_sel,
-    const uint64_t * precomputed_hashes,
-    const HT & ht,
-    const BlockStore & store,
-    ProbeMaterialiser & mat,
-    std::pmr::vector<uint64_t> & sub_hashes,
-    std::pmr::vector<uint64_t> & sub_keys,
-    std::pmr::vector<RowRefCell> & heads,
-    std::pmr::vector<size_t> & probe_idx,
-    std::pmr::vector<RowRefCell> & build_ref)
+/// One radix pass over `keys` of `rows` rows, producing a counting-
+/// sort layout indexed by leaf id: `sorted_idx[p_offsets[L] ..
+/// p_offsets[L+1])` is the list of row indices whose hash maps to
+/// leaf L. `hashes[]` is the SIMD-batched hash output. No payload
+/// bytes are touched — this is the "no-scatter" equivalent of the
+/// pass-1 radix scatter.
+[[gnu::always_inline]] inline void hashAndPartitionOnePass(
+    const uint64_t * keys,
+    size_t rows,
+    uint64_t * hashes,
+    uint32_t * sorted_idx,
+    uint32_t * p_offsets,
+    uint32_t * cursor,
+    size_t total_leaves,
+    uint32_t leaf_shift,
+    uint64_t leaf_mask)
 {
-    if (n_sel == 0)
-        return;
+    intHash64Batch(keys, rows, hashes);
 
-    sub_hashes.resize(n_sel);
-    sub_keys.resize(n_sel);
-    for (size_t k = 0; k < n_sel; ++k)
+    /// p_offsets has size total_leaves + 1; the trailing slot becomes
+    /// the row total after the prefix sum.
+    for (size_t L = 0; L < total_leaves + 1; ++L)
+        p_offsets[L] = 0;
+    for (size_t i = 0; i < rows; ++i)
+        ++p_offsets[(hashes[i] >> leaf_shift) & leaf_mask];
+
+    /// Exclusive prefix sum.
+    uint32_t acc = 0;
+    for (size_t L = 0; L <= total_leaves; ++L)
     {
-        const uint32_t i = sel_idx[k];
-        sub_keys[k] = probe_block.keys[i];
-        sub_hashes[k] = precomputed_hashes[i];
+        const uint32_t cnt = p_offsets[L];
+        p_offsets[L] = acc;
+        acc += cnt;
     }
 
-    heads.resize(n_sel);
-    ht.batchFind(sub_hashes.data(), sub_keys.data(), heads.data(), n_sel);
-
-    probe_idx.clear();
-    build_ref.clear();
-    probe_idx.reserve(n_sel);
-    build_ref.reserve(n_sel);
-    for (size_t k = 0; k < n_sel; ++k)
+    /// Fill via a cursor that mutates a copy of the offsets.
+    for (size_t L = 0; L < total_leaves; ++L)
+        cursor[L] = p_offsets[L];
+    for (size_t i = 0; i < rows; ++i)
     {
-        RowRefCell ref = heads[k];
-        while (ref.valid())
-        {
-            probe_idx.push_back(sel_idx[k]);
-            build_ref.push_back(ref);
-            ref = store.getPrev(ref);
-        }
+        const size_t L = static_cast<size_t>((hashes[i] >> leaf_shift) & leaf_mask);
+        sorted_idx[cursor[L]++] = static_cast<uint32_t>(i);
     }
-
-    if (probe_idx.empty())
-        return;
-    mat.gatherFromProbeBlock(probe_block, store, probe_idx.data(), build_ref.data(), probe_idx.size());
 }
 
 }
@@ -272,11 +254,14 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
             std::pmr::vector<Block> buffered(&tracker);
             std::vector<std::vector<uint64_t>> buf_hashes;
             std::vector<BlockPartitioning> per_block_part;
+            std::vector<uint32_t> partition_cursor;
+            partition_cursor.resize(total_leaves);
             size_t buffered_row_bytes = 0;
 
-            /// Scratch reused across flushes.
-            std::pmr::vector<uint64_t> sub_hashes(&tracker);
-            std::pmr::vector<uint64_t> sub_keys(&tracker);
+            /// Scratch reused across flushes / probe partitions.
+            std::vector<uint64_t> sub_hashes;
+            std::vector<uint64_t> sub_keys;
+            std::vector<uint32_t> block_offsets;
             std::pmr::vector<RowRefCell> heads(&tracker);
             std::pmr::vector<size_t> probe_idx(&tracker);
             std::pmr::vector<RowRefCell> build_ref(&tracker);
@@ -294,104 +279,99 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
             const size_t probe_start = (n_probe_blocks * tid) / threads;
             const size_t probe_end = (n_probe_blocks * (tid + 1)) / threads;
 
-            /// Partition one buffered block via counting sort on its
-            /// precomputed hashes. Charged to `my_probe_shuffle_ns`
-            /// since it's the (no-data-movement) equivalent of the
-            /// radix scatter.
-            auto partitionOne = [&](size_t b)
-            {
-                const size_t rows = buffered[b].rows;
-                BlockPartitioning & bp = per_block_part[b];
-                bp.sorted_idx.assign(rows, 0);
-                bp.p_offsets.assign(total_leaves + 1, 0);
-
-                /// Count
-                const uint64_t * hp = buf_hashes[b].data();
-                for (size_t i = 0; i < rows; ++i)
-                {
-                    const size_t L = static_cast<size_t>((hp[i] >> leaf_shift) & leaf_mask);
-                    ++bp.p_offsets[L];
-                }
-                /// Exclusive prefix sum into p_offsets (so p_offsets[L]
-                /// is the start of partition L); the trailing slot
-                /// p_offsets[total_leaves] becomes the row total.
-                size_t acc = 0;
-                for (size_t L = 0; L <= total_leaves; ++L)
-                {
-                    const size_t cnt = bp.p_offsets[L];
-                    bp.p_offsets[L] = static_cast<uint32_t>(acc);
-                    acc += cnt;
-                }
-                /// Fill via a cursor that mutates the offsets and is
-                /// restored implicitly by re-walking the offsets from
-                /// the prefix sum. We keep a local cursor copy to
-                /// avoid the second pass.
-                std::vector<uint32_t> cursor(total_leaves);
-                std::memcpy(cursor.data(), bp.p_offsets.data(), total_leaves * sizeof(uint32_t));
-                for (size_t i = 0; i < rows; ++i)
-                {
-                    const size_t L = static_cast<size_t>((hp[i] >> leaf_shift) & leaf_mask);
-                    bp.sorted_idx[cursor[L]++] = static_cast<uint32_t>(i);
-                }
-            };
-
-            /// Drain the buffer pool: partition every buffered block,
-            /// then probe leaf-by-leaf across all buffered blocks.
+            /// Drain the buffer pool: probe leaf-by-leaf using a single
+            /// merged `batchFind` per leaf across all buffered blocks.
+            /// The partitioning was already done at buffer time (per
+            /// the user spec) so we go straight to probing here.
             auto flushAndProbe = [&]()
             {
                 if (buffered.empty())
                     return;
                 ++my_flushes;
+                const size_t n_buf = buffered.size();
 
-                /// Phase A: incremental hash + partition the new
-                /// blocks (everything not yet partitioned).
-                const TimePoint tps0 = now();
-                for (size_t b = 0; b < buffered.size(); ++b)
-                {
-                    if (buf_hashes[b].size() != buffered[b].rows)
-                    {
-                        buf_hashes[b].resize(buffered[b].rows);
-                        intHash64Batch(buffered[b].keys.data(), buffered[b].rows, buf_hashes[b].data());
-                    }
-                    if (per_block_part[b].p_offsets.size() != total_leaves + 1)
-                        partitionOne(b);
-                }
-                my_probe_shuffle_ns += toNanos(now() - tps0);
-
-                /// Phase B: probe leaf-by-leaf across all blocks.
-                /// Each (leaf, block) cell is a contiguous run inside
-                /// `sorted_idx[block]`. The HT for leaf L stays hot
-                /// across the inner loop over blocks.
+                /// For each leaf, build ONE contiguous (sub_keys,
+                /// sub_hashes) batch across all buffered blocks (block-
+                /// ordered), do one batchFind, then per-block walk
+                /// chains and materialise via the existing
+                /// gatherFromProbeBlock (its `probe_idx` parameter is
+                /// exactly the selection vector — no payload movement
+                /// happens until the final gather into the output).
                 const TimePoint tp0 = now();
                 for (size_t L = 0; L < total_leaves; ++L)
                 {
-                    const JoinHashTable & ht = leaf_hts[L];
-                    const BlockStore & store = *leaf_stores[L];
-                    for (size_t b = 0; b < buffered.size(); ++b)
+                    sub_keys.clear();
+                    sub_hashes.clear();
+                    block_offsets.assign(n_buf + 1, 0);
+
+                    /// Phase 1: assemble the per-leaf batch in block
+                    /// order. `block_offsets[b]` becomes the start of
+                    /// block b's contribution to the batch.
+                    for (size_t b = 0; b < n_buf; ++b)
                     {
+                        block_offsets[b] = static_cast<uint32_t>(sub_keys.size());
                         const BlockPartitioning & bp = per_block_part[b];
                         const size_t start = bp.p_offsets[L];
                         const size_t end = bp.p_offsets[L + 1];
                         if (start == end)
                             continue;
-                        probeSubsetOfBuffered(
-                            buffered[b].view(),
-                            bp.sorted_idx.data() + start,
-                            end - start,
-                            buf_hashes[b].data(),
-                            ht,
-                            store,
-                            mat,
-                            sub_hashes,
-                            sub_keys,
-                            heads,
-                            probe_idx,
-                            build_ref);
+                        const uint64_t * keys = buffered[b].keys.data();
+                        const uint64_t * hp = buf_hashes[b].data();
+                        for (size_t j = start; j < end; ++j)
+                        {
+                            const uint32_t i = bp.sorted_idx[j];
+                            sub_keys.push_back(keys[i]);
+                            sub_hashes.push_back(hp[i]);
+                        }
+                    }
+                    block_offsets[n_buf] = static_cast<uint32_t>(sub_keys.size());
+
+                    if (sub_keys.empty())
+                        continue;
+
+                    /// Phase 2: one batchFind for this leaf, covering
+                    /// every buffered block. Amortises HT-setup cost
+                    /// across the whole partition rather than paying
+                    /// it once per (leaf, block) cell.
+                    heads.resize(sub_keys.size());
+                    leaf_hts[L].batchFind(sub_hashes.data(), sub_keys.data(), heads.data(), sub_keys.size());
+
+                    /// Phase 3: per-block chain walk + materialise.
+                    /// Heads are naturally grouped by block thanks to
+                    /// the block-ordered batch in phase 1, so the
+                    /// existing single-block gatherFromProbeBlock is
+                    /// reused unchanged — once per block.
+                    const BlockStore & store = *leaf_stores[L];
+                    for (size_t b = 0; b < n_buf; ++b)
+                    {
+                        const uint32_t bs = block_offsets[b];
+                        const uint32_t be = block_offsets[b + 1];
+                        if (bs == be)
+                            continue;
+                        const BlockPartitioning & bp = per_block_part[b];
+                        const uint32_t p1_start = bp.p_offsets[L];
+
+                        probe_idx.clear();
+                        build_ref.clear();
+                        for (uint32_t k = bs; k < be; ++k)
+                        {
+                            const uint32_t i = bp.sorted_idx[p1_start + (k - bs)];
+                            RowRefCell ref = heads[k];
+                            while (ref.valid())
+                            {
+                                probe_idx.push_back(i);
+                                build_ref.push_back(ref);
+                                ref = store.getPrev(ref);
+                            }
+                        }
+                        if (!probe_idx.empty())
+                            mat.gatherFromProbeBlock(
+                                buffered[b].view(), store, probe_idx.data(), build_ref.data(), probe_idx.size());
                     }
                 }
                 my_probe_ns += toNanos(now() - tp0);
 
-                /// Phase C: drop the buffer pool.
+                /// Phase C: drop the buffer pool at once.
                 const TimePoint td0 = now();
                 buffered.clear();
                 buf_hashes.clear();
@@ -423,10 +403,29 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                     dst.payloads[c].type = src.payloads[c].type;
                     dst.payloads[c].data.assign(src.payloads[c].data.begin(), src.payloads[c].data.end());
                 }
-                /// One per-block hash slot + one per-block partition
-                /// metadata slot; lazily filled at flush time.
+
+                /// PID computed PER ROW AT BUFFER TIME (per user spec):
+                /// SIMD-hash, counting-sort row indices by leaf id, in a
+                /// single radix pass. The block's payloads are NEVER
+                /// touched — only `sorted_idx[]` and `p_offsets[]` are
+                /// produced. The block is fresh in cache here from the
+                /// deep copy above, so we capitalise on warm L1.
                 buf_hashes.emplace_back();
+                buf_hashes.back().resize(dst.rows);
                 per_block_part.emplace_back();
+                BlockPartitioning & bp = per_block_part.back();
+                bp.sorted_idx.assign(dst.rows, 0);
+                bp.p_offsets.assign(total_leaves + 1, 0);
+                hashAndPartitionOnePass(
+                    dst.keys.data(),
+                    dst.rows,
+                    buf_hashes.back().data(),
+                    bp.sorted_idx.data(),
+                    bp.p_offsets.data(),
+                    partition_cursor.data(),
+                    total_leaves,
+                    leaf_shift,
+                    leaf_mask);
                 buffered_row_bytes += src.rows * bytes_per_row;
                 my_probe_shuffle_ns += toNanos(now() - tps0);
 
