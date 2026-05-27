@@ -64,12 +64,22 @@ enum class LeafState : uint8_t
 /// off-shared-memory) and then briefly locks each destination leaf
 /// to move blocks into the shared chain.
 ///
-/// The worker caches its own `unrefined` capacity-bytes counter
-/// (`unrefined_cap_bytes`) so the per-block budget check doesn't have
-/// to re-walk all pass-1 chains. A separate shared
-/// `global_unrefined_cap_bytes` atomic mirrors the sum across workers
-/// for the global peak-tracking path; the worker updates it with the
-/// delta whenever its own count changes (`refreshUnrefinedCapBytes`).
+/// The worker caches its own `unrefined` buffered-row-bytes counter
+/// (`unrefined_row_bytes` = `sum_blocks(blk.rows) * bytes_per_row`)
+/// so the per-block budget check doesn't have to re-walk all pass-1
+/// chains. A separate shared `global_unrefined_row_bytes` atomic
+/// mirrors the sum across workers for the global peak-tracking path;
+/// the worker updates it with the delta whenever its own count
+/// changes (`refreshUnrefinedRowBytes`).
+///
+/// IMPORTANT: the counter sums `blk.rows`, NOT `blk.capacity`. The
+/// budget bounds buffered probe DATA, not allocated buffer headroom.
+/// Counting capacity made the trigger fire immediately on the first
+/// scatter for partition counts × bytes_per_row that pushed even
+/// empty initial OutBlocks over the high-water threshold (the radix
+/// `initialOutBlockRows(schema)` policy allocates ~4 KiB per chain
+/// per partition the moment any row lands in it; for 1024 partitions
+/// and a 68 B probe row that's 17 MiB before any data is buffered).
 struct WorkerProbeState
 {
     std::pmr::vector<PartitionOut> unrefined;
@@ -82,7 +92,7 @@ struct WorkerProbeState
     /// shared chain).
     std::pmr::vector<PartitionOut> intermediate;
 
-    size_t unrefined_cap_bytes = 0;
+    size_t unrefined_row_bytes = 0;
     size_t bytes_per_row = 0;
 
     explicit WorkerProbeState(std::pmr::memory_resource * mr)
@@ -135,13 +145,18 @@ void compactOutBlock(OutBlock & blk)
 }
 
 
-[[gnu::always_inline]] inline size_t unrefinedCapBytesFromScan(const WorkerProbeState & s) noexcept
+/// Sum `rows × bytes_per_row` across all buffered unrefined OutBlocks
+/// for one worker. This is the "buffered probe data" measure used by
+/// the budget; allocated capacity (which can exceed rows by up to
+/// ~2× under the doubling-grow scheme) is intentionally NOT counted —
+/// see the comment on `WorkerProbeState::unrefined_row_bytes`.
+[[gnu::always_inline]] inline size_t unrefinedRowBytesFromScan(const WorkerProbeState & s) noexcept
 {
-    size_t cap_rows = 0;
+    size_t rows = 0;
     for (const auto & po : s.unrefined)
         for (const auto & blk : po.blocks)
-            cap_rows += blk.capacity;
-    return cap_rows * s.bytes_per_row;
+            rows += blk.rows;
+    return rows * s.bytes_per_row;
 }
 
 
@@ -234,7 +249,7 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
     ///
     ///   - unrefined: own per-worker pass-1 buffers. Worker T
     ///     refines its own biggest pass-1 chain when its own
-    ///     `unrefined_cap_bytes` crosses the high-water threshold,
+    ///     `unrefined_row_bytes` crosses the high-water threshold,
     ///     until it dips back below the low-water threshold. No
     ///     coordination required — each worker manages its own
     ///     pass-1 budget.
@@ -298,40 +313,45 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
 
     std::vector<std::mutex> leaf_mutexes(total_leaves);
 
-    /// Per-leaf row / capacity counters. Maintained alongside the
-    /// chains (under the same mutex) so they're consistent with
-    /// `published_leaves[L].blocks` at every observable point.
-    /// Argmax reads these atomically and uses them as hints; the
-    /// per-leaf mutex makes the "rows match blocks" invariant true.
+    /// Per-leaf row counter. Maintained alongside the chain (under
+    /// the same mutex) so it's consistent with `published_leaves[L]
+    /// .blocks` at every observable point. Argmax reads it atomically
+    /// and uses it as a hint; the per-leaf mutex makes the "rows
+    /// match blocks" invariant true. Multiplied by `bytes_per_row`
+    /// it gives this leaf's buffered probe-data byte count.
     std::vector<std::atomic<size_t>> published_leaf_rows(total_leaves);
-    std::vector<std::atomic<size_t>> published_leaf_caps(total_leaves);
     for (size_t l = 0; l < total_leaves; ++l)
-    {
         published_leaf_rows[l].store(0, std::memory_order_relaxed);
-        published_leaf_caps[l].store(0, std::memory_order_relaxed);
-    }
 
-    /// Aggregate capacity-row sum across all published leaves. Updated
-    /// lock-free outside the per-leaf mutex (it is a sum and we don't
+    /// Aggregate row sum across all published leaves. Updated lock-
+    /// free outside the per-leaf mutex (it is a sum and we don't
     /// need it to be sub-microsecond consistent with any single
     /// leaf's chain — it's a budget hint). Read once per worker per
-    /// budget check to compute "share of global leaf capacity".
-    std::atomic<size_t> global_leaf_cap_rows{0};
+    /// budget check to compute "share of global leaf buffered data".
+    /// Tracks `rows`, NOT `capacity`: a leaf chain's allocated
+    /// headroom (the OutBlock `capacity` field, set by the radix
+    /// scatter's doubling-grow policy) is irrelevant to the
+    /// "buffered probe data" semantic of the budget — only
+    /// actually-filled rows count.
+    std::atomic<size_t> global_leaf_rows{0};
 
-    /// Aggregate per-worker unrefined-capacity bytes summed across
-    /// every worker. Maintained via signed deltas: each worker, when
-    /// it refreshes its own `unrefined_cap_bytes`, adds the change to
-    /// this global. Used only for global peak tracking (see
-    /// `global_peak_probe_bytes` below) — the worker-local trigger
-    /// still consults `s.unrefined_cap_bytes` directly.
-    std::atomic<size_t> global_unrefined_cap_bytes{0};
+    /// Aggregate per-worker unrefined buffered-row-bytes summed
+    /// across every worker. Maintained via signed deltas: each
+    /// worker, when it refreshes its own `unrefined_row_bytes`, adds
+    /// the change to this global. Used only for global peak tracking
+    /// (see `global_peak_probe_bytes` below) — the worker-local
+    /// trigger still consults `s.unrefined_row_bytes` directly.
+    std::atomic<size_t> global_unrefined_row_bytes{0};
 
     /// Running maximum of the GLOBAL probe-buffer footprint observed
-    /// during the scatter+evict phase: `global_unrefined_cap_bytes +
-    /// global_leaf_cap_rows * bytes_per_row`. Updated lock-free with
-    /// a CAS loop on every per-block peak bump. This is the metric
-    /// reported as `bep_peak_mib`; with `bep_budget_mib` now global,
-    /// the peak is directly comparable to the budget.
+    /// during the scatter+evict phase: `global_unrefined_row_bytes +
+    /// global_leaf_rows * bytes_per_row`. Updated lock-free with a
+    /// CAS loop on every per-block peak bump. This is the metric
+    /// reported as `bep_peak_mib`; with `bep_budget_mib` now global
+    /// AND row-based, the peak is directly comparable to the budget
+    /// and reflects buffered probe DATA (not allocated buffer
+    /// headroom, which can exceed rows by up to ~2× under the
+    /// doubling-grow scheme).
     std::atomic<size_t> global_peak_probe_bytes{0};
 
     /// -------- PER-WORKER TIMING + COUNTERS --------
@@ -404,40 +424,41 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
             const size_t probe_start = (n_probe_blocks * tid) / threads;
             const size_t probe_end = (n_probe_blocks * (tid + 1)) / threads;
 
-            /// Per-worker view of buffered bytes: own unrefined-chain
-            /// capacity plus a fair share of the globally published
-            /// leaf-chain capacity. Used for the worker-local
-            /// triggers (compared against thresholds derived from
-            /// `per_worker_view_budget = bep_budget_mib / threads`).
+            /// Per-worker view of buffered probe DATA: own unrefined-
+            /// chain rows × bytes_per_row plus a fair share of the
+            /// globally published leaf-chain rows × bytes_per_row.
+            /// Used for the worker-local triggers (compared against
+            /// thresholds derived from `per_worker_view_budget =
+            /// bep_budget_mib / threads`).
             auto leafShareBytes
-                = [&]() noexcept -> size_t { return (global_leaf_cap_rows.load(std::memory_order_relaxed) * bytes_per_row) / threads; };
+                = [&]() noexcept -> size_t { return (global_leaf_rows.load(std::memory_order_relaxed) * bytes_per_row) / threads; };
 
-            /// Refresh `s.unrefined_cap_bytes` from the worker's
+            /// Refresh `s.unrefined_row_bytes` from the worker's
             /// chains and mirror the delta into
-            /// `global_unrefined_cap_bytes`. Called after every event
+            /// `global_unrefined_row_bytes`. Called after every event
             /// that changes the worker's own unrefined buffers
             /// (scatter into pass-1, refinement that drains a
-            /// pass-1 chain). Cheap: 64 chains × ~1-3 blocks each.
-            auto refreshUnrefinedCapBytes = [&]() noexcept
+            /// pass-1 chain). Cheap: P chains × ~1-3 blocks each.
+            auto refreshUnrefinedRowBytes = [&]() noexcept
             {
-                const size_t new_val = unrefinedCapBytesFromScan(s);
-                if (new_val >= s.unrefined_cap_bytes)
-                    global_unrefined_cap_bytes.fetch_add(new_val - s.unrefined_cap_bytes, std::memory_order_relaxed);
+                const size_t new_val = unrefinedRowBytesFromScan(s);
+                if (new_val >= s.unrefined_row_bytes)
+                    global_unrefined_row_bytes.fetch_add(new_val - s.unrefined_row_bytes, std::memory_order_relaxed);
                 else
-                    global_unrefined_cap_bytes.fetch_sub(s.unrefined_cap_bytes - new_val, std::memory_order_relaxed);
-                s.unrefined_cap_bytes = new_val;
+                    global_unrefined_row_bytes.fetch_sub(s.unrefined_row_bytes - new_val, std::memory_order_relaxed);
+                s.unrefined_row_bytes = new_val;
             };
 
             /// CAS-loop update of the GLOBAL probe-buffer peak. Every
             /// worker calls this once per input block after refreshing
-            /// its own unrefined-cap bookkeeping; the load of
-            /// `global_unrefined_cap_bytes` therefore includes this
+            /// its own unrefined-row bookkeeping; the load of
+            /// `global_unrefined_row_bytes` therefore includes this
             /// worker's latest contribution and a recent (possibly
             /// slightly stale) view of every other worker's.
             auto bumpGlobalPeak = [&]() noexcept
             {
-                const size_t cur = global_unrefined_cap_bytes.load(std::memory_order_relaxed)
-                    + global_leaf_cap_rows.load(std::memory_order_relaxed) * bytes_per_row;
+                const size_t cur = global_unrefined_row_bytes.load(std::memory_order_relaxed)
+                    + global_leaf_rows.load(std::memory_order_relaxed) * bytes_per_row;
                 size_t old_peak = global_peak_probe_bytes.load(std::memory_order_relaxed);
                 while (cur > old_peak && !global_peak_probe_bytes.compare_exchange_weak(old_peak, cur, std::memory_order_relaxed))
                 {
@@ -511,17 +532,17 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                 /// an empty blocks vector. Re-init it and refresh the
                 /// global unrefined counter BEFORE publishing the
                 /// refined intermediate into shared leaves. Without
-                /// this ordering, `global_unrefined_cap_bytes` would
-                /// still include `p1`'s capacity while
-                /// `global_leaf_cap_rows` has already absorbed it —
-                /// momentarily double-counting `p1` in any concurrent
-                /// global-peak CAS by another worker.
+                /// this ordering, `global_unrefined_row_bytes` would
+                /// still include `p1`'s rows while `global_leaf_rows`
+                /// has already absorbed them — momentarily double-
+                /// counting `p1` in any concurrent global-peak CAS
+                /// by another worker.
                 initPartitionOut(s.unrefined[p1], probe.schema);
                 s.unrefined_rows[p1] = 0;
-                refreshUnrefinedCapBytes();
+                refreshUnrefinedRowBytes();
 
                 const size_t base = p1 * leaves_per_p1;
-                size_t global_added_caps = 0;
+                size_t global_added_rows = 0;
                 for (size_t i = 0; i < leaves_per_p1; ++i)
                 {
                     PartitionOut & src = s.intermediate[i];
@@ -529,12 +550,8 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                         continue;
 
                     size_t added_rows = 0;
-                    size_t added_caps = 0;
                     for (const auto & blk : src.blocks)
-                    {
                         added_rows += blk.rows;
-                        added_caps += blk.capacity;
-                    }
                     if (added_rows == 0)
                         continue;
 
@@ -547,14 +564,13 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                                 published_leaves[L].blocks.push_back(std::move(blk));
                         }
                         published_leaf_rows[L].fetch_add(added_rows, std::memory_order_relaxed);
-                        published_leaf_caps[L].fetch_add(added_caps, std::memory_order_relaxed);
                     }
                     src.blocks.clear();
                     src.cur = nullptr;
-                    global_added_caps += added_caps;
+                    global_added_rows += added_rows;
                 }
-                if (global_added_caps != 0)
-                    global_leaf_cap_rows.fetch_add(global_added_caps, std::memory_order_relaxed);
+                if (global_added_rows != 0)
+                    global_leaf_rows.fetch_add(global_added_rows, std::memory_order_relaxed);
             };
 
             /// CAS-claim leaf L and (if claimed) construct its HT
@@ -584,7 +600,6 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
             auto stealLeafChain = [&](size_t leaf, PartitionOut & dst) noexcept -> size_t
             {
                 size_t stolen_rows = 0;
-                size_t stolen_caps = 0;
                 {
                     std::lock_guard<std::mutex> lock(leaf_mutexes[leaf]);
                     for (auto & blk : published_leaves[leaf].blocks)
@@ -592,19 +607,17 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                         if (blk.rows > 0)
                         {
                             stolen_rows += blk.rows;
-                            stolen_caps += blk.capacity;
                             dst.blocks.push_back(std::move(blk));
                         }
                     }
                     published_leaves[leaf].blocks.clear();
                     published_leaves[leaf].cur = nullptr;
-                    /// Drain the per-leaf counters inside the mutex
-                    /// so the (chain, counter) pair stays consistent.
+                    /// Drain the per-leaf counter inside the mutex so
+                    /// the (chain, counter) pair stays consistent.
                     published_leaf_rows[leaf].fetch_sub(stolen_rows, std::memory_order_relaxed);
-                    published_leaf_caps[leaf].fetch_sub(stolen_caps, std::memory_order_relaxed);
                 }
-                if (stolen_caps != 0)
-                    global_leaf_cap_rows.fetch_sub(stolen_caps, std::memory_order_relaxed);
+                if (stolen_rows != 0)
+                    global_leaf_rows.fetch_sub(stolen_rows, std::memory_order_relaxed);
                 return stolen_rows;
             };
 
@@ -739,9 +752,9 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
             auto evictAsNeeded = [&]()
             {
                 /// Phase 1: drain own unrefined to low water.
-                if (s.unrefined_cap_bytes >= unrefined_high_water_per_worker)
+                if (s.unrefined_row_bytes >= unrefined_high_water_per_worker)
                 {
-                    while (s.unrefined_cap_bytes >= unrefined_low_water_per_worker)
+                    while (s.unrefined_row_bytes >= unrefined_low_water_per_worker)
                     {
                         const size_t p1 = argmaxOwnUnrefined();
                         if (p1 == SIZE_MAX)
@@ -803,11 +816,13 @@ PhjBepResult runPhjBep(const BlockStream & build, const BlockStream & probe, con
                         continue;
                     s.unrefined_rows[p] += delta;
                 }
-                /// Refresh cached unrefined cap bytes after scatter
-                /// (a `grow()` may have been triggered inside
-                /// `scatterBatch`) and mirror the delta into the
-                /// global aggregate, then refresh the global peak.
-                refreshUnrefinedCapBytes();
+                /// Refresh cached unrefined row-bytes after scatter,
+                /// mirror the delta into the global aggregate, then
+                /// refresh the global peak. Row-based accounting so
+                /// the budget bounds buffered probe DATA, not
+                /// allocated buffer headroom (see
+                /// `unrefinedRowBytesFromScan`).
+                refreshUnrefinedRowBytes();
                 bumpGlobalPeak();
                 my_probe_shuffle_ns += toNanos(now() - tps0);
 
