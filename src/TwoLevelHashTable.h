@@ -1,73 +1,93 @@
 #pragma once
 
-#include <array>
+#include <algorithm>
+#include <bit>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <memory_resource>
 #include <mutex>
+#include <vector>
 
+#include "BlockStore.h"
 #include "HashTable.h"
 
 
 namespace phj
 {
 
-/// CH-style two-level hashtable: 256 sub-tables, top 8 hash bits select
-/// the sub-table. Each sub-table has its own mutex and resizes
-/// independently. `insertLocked` is the parallel-safe insert path;
-/// `find` is mutex-free (assumes the table is read-only after the
-/// global build/probe barrier).
+/// One independent build-side partition in a CH-style ConcurrentHashJoin.
 ///
-/// Pass a `memory_resource*` to the constructor to route all sub-table
-/// cell allocations through the caller's tracker.
-class TwoLevelJoinHashTable
+/// Each slot owns its own BlockStore and JoinHashTable. The mutex serialises
+/// concurrent build inserts from multiple workers that scatter their input
+/// blocks into this slot; only one writer is active per slot at a time so
+/// the inner JoinHashTable never needs per-cell locking.
+struct ChjSlot
+{
+    std::mutex mu;
+    BlockStore store;
+    JoinHashTable ht;
+
+    explicit ChjSlot(std::pmr::memory_resource * mr)
+        : store(mr)
+        , ht(mr)
+    {
+    }
+
+    ChjSlot(const ChjSlot &) = delete;
+    ChjSlot & operator=(const ChjSlot &) = delete;
+    ChjSlot(ChjSlot &&) = delete;
+    ChjSlot & operator=(ChjSlot &&) = delete;
+};
+
+
+/// CH-style slotted table for concurrent hash join.
+///
+/// Mirrors ClickHouse's `ConcurrentHashJoin`: `n_slots` (power-of-2, ≤ 256)
+/// independent build partitions selected by `hash & (n_slots - 1)`.
+///
+/// Build: every worker hashes its build block, bins rows by slot index, then
+/// for each non-empty bin acquires that slot's mutex and inserts — a plain
+/// single-writer JoinHashTable insert with no per-cell locking. Workers can
+/// build into different slots simultaneously.
+///
+/// Probe: each probe block is scattered by the same low hash bits, and each
+/// slot's table is queried independently. No locking needed after the build
+/// barrier since every slot's table is read-only.
+class ChjSlottedTable
 {
 public:
-    static constexpr size_t SUB_TABLES = 256;
-    static_assert((SUB_TABLES & (SUB_TABLES - 1)) == 0);
+    static constexpr size_t MAX_SLOTS = 256;
 
-    using Hash = JoinHashTable::Hash;
-    using Key = JoinHashTable::Key;
-    using Ref = JoinHashTable::Ref;
-
-    TwoLevelJoinHashTable() = default;
-
-    /// Reconstruct every sub-table in-place so that their cell vectors
-    /// use `mr`. The array elements are default-constructed first
-    /// (empty cells, default resource); we then destroy and re-construct
-    /// each one with `mr`. Since all cell vectors are empty at that
-    /// point no heap traffic occurs during the switch.
-    explicit TwoLevelJoinHashTable(std::pmr::memory_resource * mr)
+    ChjSlottedTable(size_t n_slots, std::pmr::memory_resource * mr)
     {
-        for (auto & sub : subs)
-        {
-            std::destroy_at(&sub);
-            std::construct_at(&sub, mr);
-        }
+        n_slots = std::max(n_slots, size_t{1});
+        n_slots = std::bit_ceil(n_slots);
+        n_slots = std::min(n_slots, MAX_SLOTS);
+        n_slots_ = n_slots;
+
+        slots_.resize(n_slots_);
+        for (auto & s : slots_)
+            s = std::make_unique<ChjSlot>(mr);
     }
 
-    [[gnu::always_inline]] static constexpr size_t bucketOf(Hash h) noexcept { return static_cast<size_t>(h >> 56); }
+    [[nodiscard]] size_t numSlots() const noexcept { return n_slots_; }
 
-    [[gnu::always_inline]] Ref insertLocked(Hash h, Key k, Ref r)
+    [[nodiscard]] size_t slotOf(uint64_t hash) const noexcept { return static_cast<size_t>(hash) & (n_slots_ - 1); }
+
+    [[nodiscard]] ChjSlot & slot(size_t i) noexcept { return *slots_[i]; }
+    [[nodiscard]] const ChjSlot & slot(size_t i) const noexcept { return *slots_[i]; }
+
+    /// Pre-reserve block-vector capacity in every slot's store.
+    void reserveSlotBlocks(size_t blocks_per_slot)
     {
-        const size_t b = bucketOf(h);
-        const std::scoped_lock lock(mutexes[b]);
-        return subs[b].insert(h, k, r);
-    }
-
-    [[gnu::always_inline]] Ref find(Hash h, Key k) const noexcept { return subs[bucketOf(h)].find(h, k); }
-
-    /// Batched find. Mutex-free (assumes post-barrier read-only state).
-    /// Open-addressing probe sequences remain per-cell.
-    void batchFind(const Hash * hashes, const Key * keys, Ref * out, size_t n) const noexcept
-    {
-        for (size_t i = 0; i < n; ++i)
-            out[i] = find(hashes[i], keys[i]);
+        for (auto & s : slots_)
+            s->store.reserveBlocks(blocks_per_slot);
     }
 
 private:
-    std::array<JoinHashTable, SUB_TABLES> subs;
-    std::array<std::mutex, SUB_TABLES> mutexes;
+    size_t n_slots_ = 1;
+    std::vector<std::unique_ptr<ChjSlot>> slots_;
 };
 
-}
+} // namespace phj

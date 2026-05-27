@@ -1,8 +1,8 @@
 #include "CHJ.h"
 
+#include <algorithm>
 #include <vector>
 
-#include "BlockStore.h"
 #include "JoinOps.h"
 #include "MemTracker.h"
 #include "Threading.h"
@@ -25,9 +25,16 @@ ChjResult runCHJ(const BlockStream & build, const BlockStream & probe, size_t th
     result.output.right_schema = probe.schema;
     result.output.workers.resize(threads);
 
-    BlockStore store(&tracker);
-    store.reserveBlocks(build.blocks.size());
-    TwoLevelJoinHashTable ht(&tracker);
+    /// CH-style: min(threads, 256) slots rounded to a power-of-2.
+    /// Each slot gets its own BlockStore and JoinHashTable; no shared
+    /// data structure exists during the build phase.
+    const size_t n_slots = std::min(threads, ChjSlottedTable::MAX_SLOTS);
+    ChjSlottedTable table(n_slots, &tracker);
+
+    /// Pre-reserve each slot's block-vector capacity. Every input block
+    /// scatters at most one sub-block per slot, so `build.blocks.size()`
+    /// is a tight upper bound on the number of blocks per slot.
+    table.reserveSlotBlocks(build.blocks.size());
 
     std::vector<uint64_t> build_ns(threads, 0);
     std::vector<uint64_t> probe_ns(threads, 0);
@@ -35,6 +42,10 @@ ChjResult runCHJ(const BlockStream & build, const BlockStream & probe, size_t th
     const TimePoint t_e2e0 = now();
 
     /// -------- BUILD --------
+    /// Each worker holds a slice of the input build blocks and scatters
+    /// each block's rows across slots by hash. A slot's mutex is held
+    /// only for the duration of one sub-block insert; workers that hash
+    /// to different slots proceed in parallel.
     const TimePoint t_build0 = now();
 
     parallelRun(
@@ -45,21 +56,22 @@ ChjResult runCHJ(const BlockStream & build, const BlockStream & probe, size_t th
             const size_t n = build.blocks.size();
             const size_t start = (n * tid) / threads;
             const size_t end = (n * (tid + 1)) / threads;
+
             std::pmr::vector<uint64_t> hashes(&tracker);
+            std::vector<std::vector<size_t>> slot_rows(table.numSlots());
+
             for (size_t b = start; b < end; ++b)
-            {
-                /// Deep-copy the input block through the tracker so its
-                /// key and payload storage is accounted for. The input
-                /// `build.blocks[b]` remains intact for subsequent reps.
-                Block clone(build.blocks[b], &tracker);
-                buildOneBlock(std::move(clone), store, ht, hashes);
-            }
+                buildOneBlockCHJ(build.blocks[b], table, hashes, slot_rows, &tracker);
+
             build_ns[tid] = toNanos(now() - t0);
         });
 
     const TimePoint t_build1 = now();
 
     /// -------- PROBE --------
+    /// After the build barrier the table is read-only. Each worker scatters
+    /// its probe blocks by the same hash bits and queries each slot's
+    /// JoinHashTable without any locking.
     const TimePoint t_probe0 = now();
 
     parallelRun(
@@ -75,12 +87,12 @@ ChjResult runCHJ(const BlockStream & build, const BlockStream & probe, size_t th
             mat.init(build.schema, probe.schema, result.output.workers[tid], PIPELINE_BLOCK_ROWS);
 
             std::pmr::vector<uint64_t> hashes(&tracker);
-            std::pmr::vector<RowRefCell> heads(&tracker);
             std::pmr::vector<size_t> probe_idx(&tracker);
             std::pmr::vector<RowRefCell> build_ref(&tracker);
+            std::vector<std::vector<size_t>> slot_rows(table.numSlots());
 
             for (size_t b = start; b < end; ++b)
-                probeOneBlock(probe.blocks[b].view(), store, ht, mat, hashes, heads, probe_idx, build_ref);
+                probeOneBlockCHJ(probe.blocks[b].view(), table, mat, hashes, probe_idx, build_ref, slot_rows);
 
             mat.finish();
             probe_ns[tid] = toNanos(now() - t0);
